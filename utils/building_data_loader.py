@@ -26,8 +26,9 @@ Usage:
     df = get_building_dataframe("U06", include_weather=False)
 """
 
+import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -45,6 +46,28 @@ DEFAULT_WEATHER_DATA_PATH = Path("data/keskkonnaportaal/tallinn-harku_f_kliima_t
 # Measurement point detail types (suffixes in CSV filenames)
 MEASUREMENT_POINT_DETAILS = ["näit", "pealevoolu temp", "tagasivoolu temp"]
 DEFAULT_YEARS = ["2022", "2023", "2024"]
+
+# Fixed weather column rename (keskkonnaportaal English names → standardized)
+WEATHER_COLUMN_RENAME: Dict[str, str] = {
+    "Air pressure at sea level": "air_pressure_hpa",
+    "Precipitation (hourly sum)": "precipitation_mm",
+    "Relative humidity": "relative_humidity_pct",
+    "Sunshine duration (hourly sum)": "sunshine_duration_min",
+    "Air temperature": "air_temp_c",
+    "Air temperature (hourly min)": "air_temp_min_c",
+    "Air temperature (hourly max)": "air_temp_max_c",
+    "Wind direction (10 min avg)": "wind_direction_deg",
+    "Wind speed (10 min avg)": "wind_speed_ms",
+    "Wind gust (hourly max)": "wind_gust_max_ms",
+}
+
+# Sensor column suffixes (longer first so "_näit_delta" before "_näit")
+SENSOR_SUFFIX_TO_NEW_SUFFIX = [
+    ("_näit_delta", "_measurement_delta_mwh"),
+    ("_näit", "_measurement_cumulative_mwh"),
+    ("_pealevoolu temp", "_supply_flow_temp_c"),
+    ("_tagasivoolu temp", "_return_flow_temp_c"),
+]
 
 
 def load_campus_metadata(
@@ -184,6 +207,104 @@ def get_building_overview_info(
     }
 
 
+def _normalize_sensor_prefix(prefix: str) -> str:
+    """Turn sensor id (e.g. BHB01, X02) into snake_case (bhb01, x02)."""
+    s = prefix.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    return s.strip("_") or prefix.lower()
+
+
+def build_column_rename_and_order(
+    columns: List[str],
+    add_indoor_temp_constant: bool = True,
+) -> Tuple[Dict[str, str], List[str]]:
+    """
+    Build dynamic rename mapping and column order from actual column names.
+
+    Sensor columns are detected by suffix (_näit, _pealevoolu temp, _tagasivoolu temp,
+    _näit_delta). Any prefix (BHB01, BHB02, X01, etc.) is normalized to snake_case.
+    Weather columns use a fixed mapping. Time → datetime.
+
+    Returns:
+        (rename_map, column_order). Only renames and orders columns that exist.
+    """
+    rename: Dict[str, str] = {}
+    sensor_prefixes: List[str] = []  # normalized, unique, order of first appearance
+
+    for col in columns:
+        if col == "Time":
+            rename["Time"] = "datetime"
+            continue
+        if col in WEATHER_COLUMN_RENAME:
+            rename[col] = WEATHER_COLUMN_RENAME[col]
+            continue
+        # Sensor column: prefix + known suffix
+        for suffix, new_suffix in SENSOR_SUFFIX_TO_NEW_SUFFIX:
+            if col.endswith(suffix) and len(col) > len(suffix):
+                prefix = col[: -len(suffix)].rstrip("_")
+                norm = _normalize_sensor_prefix(prefix)
+                rename[col] = norm + new_suffix
+                if norm not in sensor_prefixes:
+                    sensor_prefixes.append(norm)
+                break
+
+    # Build column order: datetime, indoor_temp_constant_c, then each sensor's 4 cols, then weather
+    weather_new_names = [WEATHER_COLUMN_RENAME[c] for c in columns if c in WEATHER_COLUMN_RENAME]
+    sensor_cols_by_prefix: Dict[str, List[str]] = {p: [] for p in sensor_prefixes}
+    for old_col, new_col in rename.items():
+        if new_col == "datetime":
+            continue
+        if new_col in weather_new_names:
+            continue
+        for p in sensor_prefixes:
+            if new_col.startswith(p + "_"):
+                sensor_cols_by_prefix[p].append(new_col)
+                break
+
+    # Per-sensor order: measurement_cumulative_mwh, supply_flow_temp_c, return_flow_temp_c, measurement_delta_mwh
+    desired_sensor_suffix_order = [
+        "_measurement_cumulative_mwh",
+        "_supply_flow_temp_c",
+        "_return_flow_temp_c",
+        "_measurement_delta_mwh",
+    ]
+
+    def sort_sensor_cols(names: List[str]) -> List[str]:
+        order = []
+        for suf in desired_sensor_suffix_order:
+            for n in names:
+                if n.endswith(suf):
+                    order.append(n)
+                    break
+        for n in names:
+            if n not in order:
+                order.append(n)
+        return order
+
+    column_order: List[str] = ["datetime"]
+    if add_indoor_temp_constant:
+        column_order.append("indoor_temp_constant_c")
+    for p in sensor_prefixes:
+        column_order.extend(sort_sensor_cols(sensor_cols_by_prefix[p]))
+    column_order.extend([
+        "air_pressure_hpa",
+        "precipitation_mm",
+        "relative_humidity_pct",
+        "sunshine_duration_min",
+        "air_temp_c",
+        "air_temp_min_c",
+        "air_temp_max_c",
+        "wind_direction_deg",
+        "wind_speed_ms",
+        "wind_gust_max_ms",
+    ])
+    # Only include columns that exist after rename
+    existing_after_rename = set(rename.values())
+    column_order = [c for c in column_order if c in existing_after_rename or c == "indoor_temp_constant_c"]
+
+    return rename, column_order
+
+
 def get_building_dataframe(
     building_code: str,
     campus_data_dir: Optional[Path] = None,
@@ -195,6 +316,8 @@ def get_building_dataframe(
     include_weather: bool = True,
     weather_data_path: Optional[Path] = None,
     weather_df: Optional[pd.DataFrame] = None,
+    rename_columns: bool = True,
+    add_indoor_temp_constant: bool = True,
     verbose: bool = False,
 ) -> pd.DataFrame:
     """
@@ -233,15 +356,19 @@ def get_building_dataframe(
         weather_df is None. Default: data/keskkonnaportaal/tallinn-harku_f_kliima_tund.csv.
     weather_df : DataFrame, optional
         Pre-loaded weather dataframe. If provided, used instead of loading from path.
+    rename_columns : bool
+        If True, rename columns to standardized names (datetime, {sensor}_measurement_cumulative_mwh,
+        {sensor}_supply_flow_temp_c, etc.) and reorder. Dynamic for any sensor prefix. Default True.
+    add_indoor_temp_constant : bool
+        If True and rename_columns=True, add column indoor_temp_constant_c = 21. Default True.
     verbose : bool
         If True, print progress (files loaded, row counts). Default False.
 
     Returns
     -------
     pd.DataFrame
-        Columns: Time, building measurement columns (BHB01_näit, ...), optionally
-        näit_delta columns, and if include_weather=True: Air temperature,
-        Relative humidity, Precipitation (hourly sum), etc.
+        Columns: Time (or datetime if renamed), building measurement columns, optionally
+        weather. If rename_columns=True: datetime, indoor_temp_constant_c, sensor cols, weather cols.
     """
     campus_data_dir = campus_data_dir or DEFAULT_CAMPUS_DATA_DIR
     years = years or DEFAULT_YEARS
@@ -335,5 +462,19 @@ def get_building_dataframe(
         dataframe = pd.merge(dataframe, weather_df, on="Time", how="left")
         if verbose:
             print(f"Merged weather: {dataframe.shape[1]} columns total.")
+
+    if rename_columns:
+        rename_map, column_order = build_column_rename_and_order(
+            list(dataframe.columns),
+            add_indoor_temp_constant=add_indoor_temp_constant,
+        )
+        dataframe = dataframe.rename(columns=rename_map)
+        if add_indoor_temp_constant:
+            dataframe["indoor_temp_constant_c"] = 21
+        # Only reorder columns that exist
+        existing = [c for c in column_order if c in dataframe.columns]
+        dataframe = dataframe[existing]
+        if verbose:
+            print(f"Renamed and reordered: {len(rename_map)} cols renamed, order: {len(existing)} cols.")
 
     return dataframe
