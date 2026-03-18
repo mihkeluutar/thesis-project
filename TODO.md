@@ -1,1 +1,0 @@
-1. Format the /data/taltech-u06-weather/README.md file correctly. Reference it in the thesis.

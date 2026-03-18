@@ -1,0 +1,3 @@
+seed,comparison,pvalue_two_sided
+42,base(setA vs setB),0.00048828125
+42,surrogate(setA vs setB),0.00048828125
