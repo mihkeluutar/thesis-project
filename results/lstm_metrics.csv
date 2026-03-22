@@ -1,5 +1,0 @@
-Building,Model,MAE,RMSE,MAPE,PeakError,R2,n_train,n_test,n_features,features,best_val_loss_scaled
-GEO,LSTM,0.7173780798912048,1.0735503180463888,15.236894607543945,11.2886381149292,0.903082549571991,10102,8783,10,"COP_ssrd_W_per_m2,COP_temp_c,COP_wind_speed_ms,dow_cos,dow_sin,heat_kwh_hist,hour_cos,hour_sin,month_cos,month_sin",0.06499338150024414
-ICO,LSTM,2.136155366897583,2.9462163939600674,19.437166213989258,33.264892578125,0.9729135632514954,10161,8783,10,"COP_ssrd_W_per_m2,COP_temp_c,COP_wind_speed_ms,dow_cos,dow_sin,heat_kwh_hist,hour_cos,hour_sin,month_cos,month_sin",0.012397730723023415
-U04,LSTM,11.507660865783691,21.06270791695412,37.59914016723633,84.5107650756836,0.3059313893318176,13498,8754,10,"COP_ssrd_W_per_m2,COP_temp_c,COP_wind_speed_ms,dow_cos,dow_sin,heat_kwh_hist,hour_cos,hour_sin,month_cos,month_sin",0.16601461172103882
-U06,LSTM,11.090386390686035,25.663535715674243,37.11625671386719,142.44229125976562,0.41375821828842163,13498,8754,10,"COP_ssrd_W_per_m2,COP_temp_c,COP_wind_speed_ms,dow_cos,dow_sin,heat_kwh_hist,hour_cos,hour_sin,month_cos,month_sin",0.33052241802215576
