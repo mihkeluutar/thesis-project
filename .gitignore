@@ -1,0 +1,93 @@
+# --- Environments (never commit) ---
+.venv/
+venv/
+env/
+.env/
+.conda/
+
+# --- Secrets / local config ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.cover
+.hypothesis/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- OS / editor noise ---
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*~
+*.swp
+*.swo
+.idea/
+
+# --- ML / experiments (regenerate from notebooks; large binaries) ---
+results/
+wandb/
+mlruns/
+tensorboard_logs/
+logs/
+runs/
+*.h5
+*.hdf5
+*.keras
+*.ckpt
+*.pth
+*.pt
+*.pkl
+*.pickle
+*.joblib
+*.onnx
+*.tflite
+*.pb
+saved_model/
+
+# --- Local datasets & derived tables (keep paths documented in README) ---
+data/
+
+# --- Misc large / vendor dumps ---
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.parquet
+*.feather
+*.arrow

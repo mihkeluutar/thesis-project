@@ -1,3 +1,0 @@
-"""
-ES Data Pipeline Package
-"""
