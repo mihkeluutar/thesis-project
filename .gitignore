@@ -83,6 +83,8 @@ saved_model/
 # --- Local datasets & derived tables (keep paths documented in README) ---
 data/
 
+graveyard/
+
 # --- Misc large / vendor dumps ---
 *.zip
 *.tar
