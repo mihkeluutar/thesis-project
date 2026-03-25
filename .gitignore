@@ -85,6 +85,8 @@ data/
 
 graveyard/
 
+example_data/
+
 # --- Misc large / vendor dumps ---
 *.zip
 *.tar
