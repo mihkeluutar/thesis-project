@@ -11,8 +11,8 @@ from pathlib import Path
 DEFAULT_BUILDINGS = ("U05", "U06", "LIB", "U02B", "SOC", "U03")
 DEFAULT_HORIZONS = (1, 2, 4, 6, 8, 12, 16, 20, 24, 36)
 DEFAULT_REGIMES = ("per_building", "pooled_same_buildings")
-DEFAULT_WEATHER_MODES = ("FW0", "FW2", "FW1")
-DEFAULT_MODES = ("M0", "M2", "M4")
+DEFAULT_WEATHER_MODES = ("FW0", "FW1", "FW2")
+DEFAULT_MODES = ("M0", "M1", "M2", "M4")
 DEFAULT_MODEL_FAMILIES = ("lstm", "xgboost")
 
 
@@ -57,7 +57,7 @@ def _parse_args() -> argparse.Namespace:
         subparser.add_argument("--lookback-hours", type=int, default=72)
         subparser.add_argument(
             "--results-dir",
-            default=str(PROJECT_ROOT / "results" / "model_family_comparison_23032026"),
+            default=str(PROJECT_ROOT / "results" / "model_family_comparison_29032026"),
         )
         subparser.add_argument("--lstm-architecture-id", default="A6")
         subparser.add_argument("--xgb-preset-id", default="P01_md3_lr003_mc5")

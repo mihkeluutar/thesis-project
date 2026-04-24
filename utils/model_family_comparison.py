@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Iterable
@@ -38,9 +39,13 @@ FEATURE_CATALOG_FILE = FEATURE_DIR / "feature_catalog.csv"
 DEFAULT_BUILDINGS = ("U05", "U06", "LIB", "U02B", "SOC", "U03")
 DEFAULT_HORIZONS = (1, 2, 4, 6, 8, 12, 16, 20, 24, 36)
 DEFAULT_REGIMES = ("per_building", "pooled_same_buildings")
-DEFAULT_WEATHER_MODES = ("FW0", "FW2", "FW1")
-DEFAULT_MODES = ("M0", "M2", "M4")
+DEFAULT_WEATHER_MODES = ("FW0", "FW1", "FW2")
+DEFAULT_MODES = ("M0", "M1", "M2", "M4")
 DEFAULT_MODEL_FAMILIES = ("lstm", "xgboost")
+CANONICAL_MODE_ORDER = ("M0", "M1", "M2", "M3", "M4")
+CANONICAL_WEATHER_MODE_ORDER = ("FW0", "FW1", "FW2")
+COMPARISON_MANIFEST_KEY_COLS = ["regime", "building", "model_family", "mode", "weather_mode", "horizon_h"]
+COMPARISON_PAIR_KEY_COLS = ["regime", "building", "mode", "weather_mode", "horizon_h"]
 
 HEATING_TEMP_THRESHOLD_C = 15.0
 XGB_FIXED_PARAMS = {
@@ -103,7 +108,9 @@ LSTM_STATIC_FEATURES_SETB = [
 
 MODE_TEMPORAL_FEATURES = {
     "M0": LSTM_BASE_TEMPORAL_FEATURES.copy(),
+    "M1": LSTM_BASE_TEMPORAL_FEATURES + LSTM_WEATHER_MEMORY_FEATURES,
     "M2": LSTM_BASE_TEMPORAL_FEATURES + LSTM_SYSTEM_DYNAMIC_FEATURES,
+    "M3": LSTM_BASE_TEMPORAL_FEATURES + LSTM_WEATHER_MEMORY_FEATURES + LSTM_SYSTEM_DYNAMIC_FEATURES,
     "M4": LSTM_BASE_TEMPORAL_FEATURES + LSTM_WEATHER_MEMORY_FEATURES + LSTM_SYSTEM_DYNAMIC_FEATURES,
 }
 for _mode_name, _cols in list(MODE_TEMPORAL_FEATURES.items()):
@@ -134,6 +141,45 @@ ARCHITECTURES = {
 XGB_PRESET_LOOKUP = {preset["preset_id"]: preset for preset in PRESET_CANDIDATES}
 
 
+MODE_DESCRIPTIONS = {
+    "M0": "Base temporal core only: observed heat, current outdoor weather, wind, solar, and cyclic calendar features.",
+    "M1": "M0 plus historical weather memory via the 24h rolling outdoor-temperature feature.",
+    "M2": "M0 plus system / inertia proxies from space-heating and ventilation loop activity and deltaT state.",
+    "M3": "M1 plus M2, still dynamic-only and still sourced from setA.",
+    "M4": "M3 plus the static building-context branch from setB; forecasts still remain a weather-mode choice, not a mode property.",
+}
+
+WEATHER_MODE_DESCRIPTIONS = {
+    "FW0": {
+        "description": "No future weather is appended.",
+        "future_weather_origin": "none",
+        "operational_status": "baseline",
+        "upper_bound_only": False,
+        "forecast_like": False,
+        "exported_in_regular_feature_csv": False,
+        "built_in_memory_at_runtime": False,
+    },
+    "FW1": {
+        "description": "Oracle future weather is built in memory from actual future temperature / RH and should be treated as an upper bound only.",
+        "future_weather_origin": "oracle future weather",
+        "operational_status": "upper_bound_only",
+        "upper_bound_only": True,
+        "forecast_like": False,
+        "exported_in_regular_feature_csv": False,
+        "built_in_memory_at_runtime": True,
+    },
+    "FW2": {
+        "description": "Forecast-like proxy future weather comes from exported feat_fw_* columns in the regular setA / setB feature files.",
+        "future_weather_origin": "forecast-like proxy future weather",
+        "operational_status": "operational_analogue",
+        "upper_bound_only": False,
+        "forecast_like": True,
+        "exported_in_regular_feature_csv": True,
+        "built_in_memory_at_runtime": False,
+    },
+}
+
+
 @dataclass(frozen=True)
 class ExperimentConfig:
     buildings: tuple[str, ...] = DEFAULT_BUILDINGS
@@ -153,6 +199,7 @@ class ExperimentConfig:
     epochs: int = 50
     early_stopping_patience: int = 8
     learning_rate: float = 1e-3
+    deterministic_ops: bool = True
     model_families: tuple[str, ...] = DEFAULT_MODEL_FAMILIES
 
 
@@ -364,6 +411,509 @@ def _write_outputs(paths: dict[str, Path], outputs: ComparisonOutputs) -> None:
     normalized.xgb_eval_history_df.to_csv(paths["xgb_history"], index=False)
 
 
+def build_defended_comparison_contract_metadata(
+    *,
+    rmse_metric_label: str = "Cumulative RMSE (kWh)",
+    rmse_context_csv: str = "rmse_load_context_per_building.csv",
+) -> dict[str, Any]:
+    return {
+        "reported_target_column": "heat_kwh",
+        "reported_error_unit": "kWh",
+        "headline_metric": "WAPE_pct",
+        "rmse_metric_label": rmse_metric_label,
+        "heating_rule_name": "weather_defined_heating_slice",
+        "heating_threshold_c": float(HEATING_TEMP_THRESHOLD_C),
+        "heating_flag_column": "feat_is_heating_weather",
+        "heating_flag_rule": "flag > 0.5 when present",
+        "heating_fallback_rule": f"feat_outdoor_temp_c < {HEATING_TEMP_THRESHOLD_C:.1f}",
+        "evaluation_population": "matched_valid_heating_rows",
+        "no_heating_row_fallback": "all_rows_emergency_fallback",
+        "rmse_context_stat": "median_observed_load_kwh",
+        "rmse_context_csv": rmse_context_csv,
+    }
+
+
+def attach_defended_comparison_contract(
+    df: pd.DataFrame,
+    *,
+    rmse_metric_label: str = "Cumulative RMSE (kWh)",
+    rmse_context_csv: str = "rmse_load_context_per_building.csv",
+) -> pd.DataFrame:
+    work = df.copy()
+    metadata = build_defended_comparison_contract_metadata(
+        rmse_metric_label=rmse_metric_label,
+        rmse_context_csv=rmse_context_csv,
+    )
+    for key, value in metadata.items():
+        work[key] = value
+    return work
+
+
+def build_rmse_load_context_table(predictions_df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "regime",
+        "building",
+        "mode",
+        "weather_mode",
+        "horizon_h",
+        "n_eval_rows",
+        "median_observed_load_kwh",
+        "mean_observed_load_kwh",
+        "evaluation_population",
+    ]
+    if predictions_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    dedupe_cols = ["regime", "building", "mode", "weather_mode", "horizon_h", "datetime"]
+    base = (
+        predictions_df.copy()
+        .drop_duplicates(subset=dedupe_cols)
+        .sort_values(dedupe_cols)
+        .reset_index(drop=True)
+    )
+    group_cols = ["regime", "building", "mode", "weather_mode", "horizon_h"]
+    rows: list[dict[str, Any]] = []
+    for keys, group in base.groupby(group_cols, dropna=False):
+        heating_group = group.loc[group["is_heating_eval"].fillna(False)].copy()
+        chosen = heating_group if not heating_group.empty else group
+        evaluation_population = "matched_valid_heating_rows" if not heating_group.empty else "all_rows_emergency_fallback"
+        rows.append(
+            {
+                "regime": keys[0],
+                "building": keys[1],
+                "mode": keys[2],
+                "weather_mode": keys[3],
+                "horizon_h": int(keys[4]),
+                "n_eval_rows": int(len(chosen)),
+                "median_observed_load_kwh": float(chosen["y_true"].median()),
+                "mean_observed_load_kwh": float(chosen["y_true"].mean()),
+                "evaluation_population": evaluation_population,
+            }
+        )
+    return pd.DataFrame(rows, columns=cols).sort_values(group_cols).reset_index(drop=True)
+
+
+def write_defended_comparison_contract_metadata(
+    *,
+    report_dir: Path,
+    rmse_metric_label: str = "Cumulative RMSE (kWh)",
+    rmse_context_csv: str = "rmse_load_context_per_building.csv",
+) -> Path:
+    report_dir = Path(report_dir).resolve()
+    report_dir.mkdir(parents=True, exist_ok=True)
+    metadata = build_defended_comparison_contract_metadata(
+        rmse_metric_label=rmse_metric_label,
+        rmse_context_csv=rmse_context_csv,
+    )
+    metadata_path = report_dir / "comparison_contract_metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    return metadata_path
+
+
+def clone_experiment_config(
+    config: ExperimentConfig,
+    **overrides: Any,
+) -> ExperimentConfig:
+    config_kwargs = {name: getattr(config, name) for name in config.__dataclass_fields__.keys()}
+    config_kwargs.update(overrides)
+    return ExperimentConfig(**config_kwargs)
+
+
+def build_mode_semantics_table() -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    base_set = set(MODE_TEMPORAL_FEATURES["M0"])
+    weather_memory_set = set(LSTM_WEATHER_MEMORY_FEATURES)
+    system_dynamic_set = set(LSTM_SYSTEM_DYNAMIC_FEATURES)
+    static_set = set(LSTM_STATIC_FEATURES_SETB)
+    for mode in CANONICAL_MODE_ORDER:
+        dynamic_cols = MODE_TEMPORAL_FEATURES[mode]
+        dynamic_set = set(dynamic_cols)
+        rows.append(
+            {
+                "mode": mode,
+                "feature_frame": "setB" if mode == "M4" else "setA",
+                "dynamic_feature_count": int(len(dynamic_cols)),
+                "base_temporal_core_count": int(len(dynamic_set & base_set)),
+                "weather_memory_feature_count": int(len(dynamic_set & weather_memory_set)),
+                "system_dynamic_feature_count": int(len(dynamic_set & system_dynamic_set)),
+                "static_feature_count": int(len(static_set) if mode == "M4" else 0),
+                "uses_weather_memory": bool(len(dynamic_set & weather_memory_set) > 0),
+                "uses_system_inertia": bool(len(dynamic_set & system_dynamic_set) > 0),
+                "uses_static_branch": bool(mode == "M4"),
+                "description": MODE_DESCRIPTIONS[mode],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_weather_mode_semantics_table(
+    config: ExperimentConfig | None = None,
+    *,
+    base_frames: dict[str, dict[str, pd.DataFrame]] | None = None,
+    sample_building: str = "U05",
+    sample_horizon_h: int = 24,
+) -> pd.DataFrame:
+    config = config or ExperimentConfig()
+    if sample_building not in config.buildings:
+        sample_building = str(config.buildings[0])
+
+    if base_frames is None:
+        sample_config = clone_experiment_config(
+            config,
+            buildings=(sample_building,),
+            horizons=(int(sample_horizon_h),),
+        )
+        base_frames = build_base_frame_cache(sample_config)
+
+    sample_frame = base_frames[sample_building]["setA"].copy()
+    rows: list[dict[str, Any]] = []
+    for weather_mode in CANONICAL_WEATHER_MODE_ORDER:
+        frame_out, fw_cols = apply_weather_mode(sample_frame.copy(), weather_mode, int(sample_horizon_h))
+        desc = WEATHER_MODE_DESCRIPTIONS[weather_mode]
+        rows.append(
+            {
+                "weather_mode": weather_mode,
+                "sample_building": sample_building,
+                "sample_horizon_h": int(sample_horizon_h),
+                "future_weather_feature_count": int(len(fw_cols)),
+                "sample_feature_example": ", ".join(fw_cols[:6]),
+                "future_weather_origin": desc["future_weather_origin"],
+                "operational_status": desc["operational_status"],
+                "upper_bound_only": bool(desc["upper_bound_only"]),
+                "forecast_like": bool(desc["forecast_like"]),
+                "exported_in_regular_feature_csv": bool(desc["exported_in_regular_feature_csv"]),
+                "built_in_memory_at_runtime": bool(desc["built_in_memory_at_runtime"]),
+                "description": desc["description"],
+                "sample_frame_rows": int(len(frame_out)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def annotate_comparison_scope(
+    df: pd.DataFrame,
+    *,
+    aggregated: bool = False,
+    artifact_kind: str = "evaluation",
+) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    work = df.copy()
+    regime = work["regime"].astype(str)
+    artifact_kind = str(artifact_kind)
+    if aggregated or artifact_kind == "portfolio_summary" or "building" not in work.columns:
+        work["evaluation_building"] = pd.NA
+        work["training_scope"] = np.where(regime.eq("pooled_same_buildings"), "POOLED", "PER_BUILDING_MODEL")
+        work["evaluation_level"] = "portfolio_summary"
+        work["scope_label"] = np.where(
+            regime.eq("pooled_same_buildings"),
+            "pooled training, summary aggregated across evaluation buildings",
+            "per-building training, summary aggregated across evaluation buildings",
+        )
+    elif artifact_kind == "training_run":
+        building = work["building"].astype(str)
+        work["evaluation_building"] = np.where(regime.eq("pooled_same_buildings"), pd.NA, building)
+        work["training_scope"] = np.where(regime.eq("pooled_same_buildings"), "POOLED", building)
+        work["evaluation_level"] = "training_run"
+        work["scope_label"] = np.where(
+            regime.eq("pooled_same_buildings"),
+            "pooled training run",
+            "per-building training run",
+        )
+    else:
+        building = work["building"].astype(str)
+        work["evaluation_building"] = building
+        work["training_scope"] = np.where(regime.eq("pooled_same_buildings"), "POOLED", building)
+        work["evaluation_level"] = "building"
+        work["scope_label"] = np.where(
+            regime.eq("pooled_same_buildings"),
+            "pooled training, building-level evaluation",
+            "per-building training, same-building evaluation",
+        )
+    work["training_scope_kind"] = np.where(regime.eq("pooled_same_buildings"), "pooled_same_buildings", "per_building")
+    return work
+
+
+def build_mode_delta_tables(
+    metrics_df: pd.DataFrame,
+    *,
+    mode_pairs: tuple[tuple[str, str], ...],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if metrics_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    detailed_rows: list[dict[str, Any]] = []
+    group_cols = ["regime", "building", "model_family", "weather_mode", "horizon_h"]
+    for keys, group_df in metrics_df.groupby(group_cols, dropna=False):
+        mode_lookup = {
+            str(mode): row
+            for mode, row in group_df.set_index("mode").iterrows()
+        }
+        for lhs_mode, rhs_mode in mode_pairs:
+            if lhs_mode not in mode_lookup or rhs_mode not in mode_lookup:
+                continue
+            lhs_row = mode_lookup[lhs_mode]
+            rhs_row = mode_lookup[rhs_mode]
+            row = {col: value for col, value in zip(group_cols, keys)}
+            row["comparison"] = f"{lhs_mode} - {rhs_mode}"
+            row["lhs_mode"] = lhs_mode
+            row["rhs_mode"] = rhs_mode
+            row["training_scope"] = "POOLED" if str(row["regime"]) == "pooled_same_buildings" else str(row["building"])
+            row["delta_wape_pct"] = float(lhs_row["wape_pct"] - rhs_row["wape_pct"])
+            row["delta_rmse"] = float(lhs_row["rmse"] - rhs_row["rmse"])
+            row["delta_r2"] = float(lhs_row["r2"] - rhs_row["r2"])
+            row["delta_mae"] = float(lhs_row["mae"] - rhs_row["mae"])
+            detailed_rows.append(row)
+
+    detailed_df = pd.DataFrame(detailed_rows)
+    if detailed_df.empty:
+        return detailed_df, pd.DataFrame()
+
+    summary_df = (
+        detailed_df.groupby(
+            ["regime", "model_family", "weather_mode", "horizon_h", "comparison", "lhs_mode", "rhs_mode"],
+            as_index=False,
+        )
+        .agg(
+            n_buildings=("building", "nunique"),
+            mean_delta_wape_pct=("delta_wape_pct", "mean"),
+            median_delta_wape_pct=("delta_wape_pct", "median"),
+            buildings_improved_wape=("delta_wape_pct", lambda s: int((pd.to_numeric(s, errors="coerce") < 0).sum())),
+            mean_delta_rmse=("delta_rmse", "mean"),
+            mean_delta_r2=("delta_r2", "mean"),
+            mean_delta_mae=("delta_mae", "mean"),
+        )
+        .sort_values(["regime", "model_family", "weather_mode", "horizon_h", "lhs_mode", "rhs_mode"])
+        .reset_index(drop=True)
+    )
+    summary_df["scope_label"] = np.where(
+        summary_df["regime"].astype(str).eq("pooled_same_buildings"),
+        "pooled training, building-level evaluation",
+        "per-building training, same-building evaluation",
+    )
+    return detailed_df.sort_values(group_cols + ["lhs_mode", "rhs_mode"]).reset_index(drop=True), summary_df
+
+
+def merge_comparison_outputs(*outputs: ComparisonOutputs) -> ComparisonOutputs:
+    merged = ComparisonOutputs()
+    for output in outputs:
+        if output is None:
+            continue
+        merged.manifest_df = _append_frame(merged.manifest_df, output.manifest_df)
+        merged.comparison_predictions_df = _append_frame(merged.comparison_predictions_df, output.comparison_predictions_df)
+        merged.comparison_metrics_df = _append_frame(merged.comparison_metrics_df, output.comparison_metrics_df)
+        merged.comparison_coverage_df = _append_frame(merged.comparison_coverage_df, output.comparison_coverage_df)
+        merged.run_log_df = _append_frame(merged.run_log_df, output.run_log_df)
+        merged.lstm_training_history_df = _append_frame(merged.lstm_training_history_df, output.lstm_training_history_df)
+        merged.xgb_eval_history_df = _append_frame(merged.xgb_eval_history_df, output.xgb_eval_history_df)
+    return _normalize_outputs(merged)
+
+
+def latest_comparison_run_log(run_log_df: pd.DataFrame) -> pd.DataFrame:
+    if run_log_df.empty:
+        return run_log_df.copy()
+    key_cols = ["regime", "building", "model_family", "mode", "weather_mode", "horizon_h"]
+    work = run_log_df.copy()
+    work["slot_index"] = pd.to_numeric(work.get("slot_index", np.nan), errors="coerce")
+    if "elapsed_s" in work.columns:
+        work["elapsed_s"] = pd.to_numeric(work["elapsed_s"], errors="coerce")
+    status_rank = work["status"].astype(str).map({"ok": 3, "skipped_insufficient_sequences": 2, "skipped_insufficient_rows": 2, "error": 1}).fillna(0)
+    work["_status_rank"] = status_rank.astype(int)
+    sort_cols = [col for col in ["slot_index", "_status_rank", "elapsed_s"] if col in work.columns]
+    work = work.sort_values(key_cols + sort_cols)
+    return work.drop_duplicates(subset=key_cols, keep="last").drop(columns=["_status_rank"]).reset_index(drop=True)
+
+
+def export_report_ready_model_family_artifacts(
+    outputs: ComparisonOutputs,
+    config: ExperimentConfig,
+    report_dir: Path,
+    *,
+    main_modes: tuple[str, ...],
+    transition_mode_pairs: tuple[tuple[str, str], ...],
+    focus_weather_mode: str = "FW2",
+    sample_building: str = "U05",
+    sample_horizon_h: int = 24,
+    desired_manifest_df: pd.DataFrame | None = None,
+) -> dict[str, pd.DataFrame]:
+    report_dir = Path(report_dir).resolve()
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_config = clone_experiment_config(config, results_dir=report_dir)
+    normalized = _normalize_outputs(outputs)
+    _write_outputs(ensure_results_dirs(report_config), normalized)
+    rmse_context_df = build_rmse_load_context_table(normalized.comparison_predictions_df)
+    rmse_context_path = report_dir / "rmse_load_context_per_building.csv"
+    rmse_context_df.to_csv(rmse_context_path, index=False)
+    write_defended_comparison_contract_metadata(
+        report_dir=report_dir,
+        rmse_metric_label="Cumulative RMSE (kWh)",
+        rmse_context_csv=rmse_context_path.name,
+    )
+
+    base_frames = build_base_frame_cache(
+        clone_experiment_config(config, buildings=(sample_building,), horizons=(int(sample_horizon_h),))
+    )
+    mode_semantics_df = build_mode_semantics_table()
+    weather_mode_semantics_df = build_weather_mode_semantics_table(
+        config,
+        base_frames=base_frames,
+        sample_building=sample_building,
+        sample_horizon_h=sample_horizon_h,
+    )
+    manifest_report_df = annotate_comparison_scope(normalized.manifest_df, artifact_kind="training_run")
+    metrics_report_df = annotate_comparison_scope(normalized.comparison_metrics_df, artifact_kind="evaluation")
+    coverage_report_df = annotate_comparison_scope(normalized.comparison_coverage_df, artifact_kind="evaluation")
+    summary_report_df = annotate_comparison_scope(normalized.comparison_summary_df, artifact_kind="portfolio_summary", aggregated=True)
+    summary_report_df = attach_defended_comparison_contract(
+        summary_report_df,
+        rmse_metric_label="Cumulative RMSE (kWh)",
+        rmse_context_csv=rmse_context_path.name,
+    )
+    run_log_latest_df = annotate_comparison_scope(
+        latest_comparison_run_log(normalized.run_log_df),
+        artifact_kind="training_run",
+    )
+    desired_manifest_scope_df = (
+        _normalize_comparison_manifest_frame(desired_manifest_df)
+        if desired_manifest_df is not None
+        else normalized.manifest_df.copy()
+    )
+    inventory_df = build_comparison_matrix_inventory(
+        desired_manifest_scope_df,
+        normalized.manifest_df,
+        source_dir=report_dir,
+        notebook="12",
+        layer="model_family_comparison",
+    )
+    missing_manifest_df = build_missing_comparison_manifest(
+        desired_manifest_scope_df,
+        normalized.manifest_df,
+    )
+
+    thesis_main_summary_df = summary_report_df.loc[
+        (summary_report_df["regime"].astype(str) == "per_building")
+        & (summary_report_df["mode"].astype(str).isin(main_modes))
+        & (summary_report_df["weather_mode"].astype(str) == str(focus_weather_mode))
+    ].copy()
+    thesis_pooled_summary_df = summary_report_df.loc[
+        (summary_report_df["regime"].astype(str) == "pooled_same_buildings")
+        & (summary_report_df["mode"].astype(str).isin(main_modes))
+        & (summary_report_df["weather_mode"].astype(str) == str(focus_weather_mode))
+    ].copy()
+    mode_delta_detail_df, mode_delta_summary_df = build_mode_delta_tables(
+        normalized.comparison_metrics_df,
+        mode_pairs=transition_mode_pairs,
+    )
+
+    exports = {
+        "comparison_manifest_report.csv": manifest_report_df,
+        "mode_semantics.csv": mode_semantics_df,
+        "weather_mode_semantics.csv": weather_mode_semantics_df,
+        "comparison_metrics_report.csv": metrics_report_df,
+        "comparison_coverage_report.csv": coverage_report_df,
+        "comparison_summary_report.csv": summary_report_df,
+        "run_log_latest_report.csv": run_log_latest_df,
+        "thesis_per_building_summary.csv": thesis_main_summary_df,
+        "thesis_pooled_summary.csv": thesis_pooled_summary_df,
+        "mode_delta_detail.csv": mode_delta_detail_df,
+        "mode_delta_summary.csv": mode_delta_summary_df,
+        "comparison_matrix_inventory.csv": inventory_df,
+        "comparison_manifest_missing.csv": missing_manifest_df,
+    }
+    for filename, df in exports.items():
+        df.to_csv(report_dir / filename, index=False)
+    return exports
+
+
+def validate_saved_metric_recompute(
+    outputs: ComparisonOutputs,
+    *,
+    report_dir: Path,
+    building: str,
+    mode: str,
+    weather_mode: str,
+    horizon_h: int,
+) -> pd.DataFrame:
+    report_dir = Path(report_dir).resolve()
+    report_dir.mkdir(parents=True, exist_ok=True)
+    predictions_df = outputs.comparison_predictions_df.copy()
+    metrics_df = outputs.comparison_metrics_df.copy()
+    if predictions_df.empty or metrics_df.empty:
+        validation_df = pd.DataFrame()
+        validation_df.to_csv(report_dir / "metric_recompute_validation.csv", index=False)
+        return validation_df
+
+    rows: list[dict[str, Any]] = []
+    regimes = [
+        regime
+        for regime in DEFAULT_REGIMES
+        if regime in set(metrics_df["regime"].astype(str))
+    ]
+    model_families = sorted(metrics_df["model_family"].astype(str).unique().tolist())
+
+    for regime in regimes:
+        for model_family in model_families:
+            pred_slice = predictions_df.loc[
+                (predictions_df["regime"].astype(str) == str(regime))
+                & (predictions_df["building"].astype(str) == str(building))
+                & (predictions_df["model_family"].astype(str) == str(model_family))
+                & (predictions_df["mode"].astype(str) == str(mode))
+                & (predictions_df["weather_mode"].astype(str) == str(weather_mode))
+                & (pd.to_numeric(predictions_df["horizon_h"], errors="coerce") == int(horizon_h))
+            ].copy()
+            metric_slice = metrics_df.loc[
+                (metrics_df["regime"].astype(str) == str(regime))
+                & (metrics_df["building"].astype(str) == str(building))
+                & (metrics_df["model_family"].astype(str) == str(model_family))
+                & (metrics_df["mode"].astype(str) == str(mode))
+                & (metrics_df["weather_mode"].astype(str) == str(weather_mode))
+                & (pd.to_numeric(metrics_df["horizon_h"], errors="coerce") == int(horizon_h))
+            ].copy()
+            if pred_slice.empty or metric_slice.empty:
+                continue
+
+            eval_slice = pred_slice.copy()
+            if "is_heating_eval" in eval_slice.columns:
+                eval_mask = eval_slice["is_heating_eval"].fillna(False).astype(bool)
+                if eval_mask.any():
+                    eval_slice = eval_slice.loc[eval_mask].copy()
+            recomputed = compute_regression_metrics(
+                eval_slice["y_true"].to_numpy(dtype=float),
+                eval_slice["y_pred"].to_numpy(dtype=float),
+            )
+            metric_row = metric_slice.iloc[0]
+            row = {
+                "regime": regime,
+                "building": str(building),
+                "model_family": model_family,
+                "mode": str(mode),
+                "weather_mode": str(weather_mode),
+                "horizon_h": int(horizon_h),
+                "n_prediction_rows": int(len(pred_slice)),
+                "n_eval_rows": int(len(eval_slice)),
+            }
+            max_abs_diff = 0.0
+            for metric_name in ("rmse", "wape_pct", "r2", "mae"):
+                saved_value = float(metric_row[metric_name])
+                recomputed_value = float(recomputed[metric_name])
+                diff = recomputed_value - saved_value
+                row[f"saved_{metric_name}"] = saved_value
+                row[f"recomputed_{metric_name}"] = recomputed_value
+                row[f"delta_{metric_name}"] = diff
+                max_abs_diff = max(max_abs_diff, abs(diff))
+            row["max_abs_diff"] = max_abs_diff
+            row["matches_within_1e-9"] = bool(max_abs_diff <= 1e-9)
+            rows.append(row)
+
+    validation_df = (
+        pd.DataFrame(rows).sort_values(["regime", "model_family"]).reset_index(drop=True)
+        if rows
+        else pd.DataFrame()
+    )
+    validation_df.to_csv(report_dir / "metric_recompute_validation.csv", index=False)
+    return validation_df
+
+
 def _pair_mask_common(
     df: pd.DataFrame,
     regime: str,
@@ -544,6 +1094,207 @@ def _artifact_frames_by_comparison_slot(df: pd.DataFrame) -> dict[str, pd.DataFr
     return out
 
 
+def _comparison_pair_plan_df(
+    config: ExperimentConfig,
+    *,
+    manifest_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    plan_df = manifest_df.copy() if manifest_df is not None else build_comparison_manifest(config)
+    if plan_df.empty:
+        return pd.DataFrame(columns=COMPARISON_PAIR_KEY_COLS)
+    work = plan_df.copy()
+    for col in COMPARISON_PAIR_KEY_COLS:
+        if col not in work.columns:
+            work[col] = pd.NA
+    work["horizon_h"] = pd.to_numeric(work["horizon_h"], errors="coerce")
+    work = work.loc[work["horizon_h"].notna(), COMPARISON_PAIR_KEY_COLS].copy()
+    if work.empty:
+        return pd.DataFrame(columns=COMPARISON_PAIR_KEY_COLS)
+    work["regime"] = work["regime"].astype(str)
+    work["building"] = work["building"].astype(str)
+    work["mode"] = work["mode"].astype(str)
+    work["weather_mode"] = work["weather_mode"].astype(str)
+    work["horizon_h"] = work["horizon_h"].astype(int)
+    return work.drop_duplicates().sort_values(COMPARISON_PAIR_KEY_COLS).reset_index(drop=True)
+
+
+def _normalize_comparison_manifest_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=COMPARISON_MANIFEST_KEY_COLS + ["run_id"])
+    work = df.copy()
+    for col in COMPARISON_MANIFEST_KEY_COLS:
+        if col not in work.columns:
+            work[col] = pd.NA
+    if "run_id" not in work.columns:
+        work["run_id"] = pd.NA
+    work["horizon_h"] = pd.to_numeric(work["horizon_h"], errors="coerce")
+    work = work.loc[work["horizon_h"].notna(), COMPARISON_MANIFEST_KEY_COLS + ["run_id"]].copy()
+    if work.empty:
+        return pd.DataFrame(columns=COMPARISON_MANIFEST_KEY_COLS + ["run_id"])
+    for col in ("regime", "building", "model_family", "mode", "weather_mode"):
+        work[col] = work[col].astype(str)
+    work["horizon_h"] = work["horizon_h"].astype(int)
+    return (
+        work.drop_duplicates(subset=COMPARISON_MANIFEST_KEY_COLS, keep="last")
+        .sort_values(COMPARISON_MANIFEST_KEY_COLS)
+        .reset_index(drop=True)
+    )
+
+
+def build_missing_comparison_manifest(
+    desired_manifest_df: pd.DataFrame,
+    current_manifest_df: pd.DataFrame,
+) -> pd.DataFrame:
+    desired = _normalize_comparison_manifest_frame(desired_manifest_df)
+    current = _normalize_comparison_manifest_frame(current_manifest_df)
+    if desired.empty:
+        return desired.copy()
+    current_keys = current.loc[:, COMPARISON_MANIFEST_KEY_COLS].drop_duplicates()
+    missing = desired.merge(
+        current_keys.assign(_present=True),
+        on=COMPARISON_MANIFEST_KEY_COLS,
+        how="left",
+    )
+    missing = missing.loc[missing["_present"].fillna(False) == False].drop(columns="_present")
+    return missing.reset_index(drop=True)
+
+
+def build_comparison_matrix_inventory(
+    desired_manifest_df: pd.DataFrame,
+    current_manifest_df: pd.DataFrame,
+    *,
+    source_dir: Path | str,
+    notebook: str = "12",
+    layer: str = "model_family_comparison",
+) -> pd.DataFrame:
+    desired = _normalize_comparison_manifest_frame(desired_manifest_df)
+    current = _normalize_comparison_manifest_frame(current_manifest_df)
+    if desired.empty:
+        return pd.DataFrame(
+            columns=[
+                "notebook",
+                "layer",
+                "source_dir",
+                "model_family_scope",
+                "regime",
+                "building_scope",
+                "mode",
+                "weather_mode",
+                "horizon_h",
+                "seed",
+                "target_kind",
+                "status",
+                "completed_now",
+                "desired_full_matrix",
+                "notes",
+                "building",
+                "model_family",
+                "run_id",
+            ]
+        )
+    source_path = str(Path(source_dir).resolve())
+    inventory = desired.merge(
+        current.loc[:, COMPARISON_MANIFEST_KEY_COLS].drop_duplicates().assign(completed_now=True),
+        on=COMPARISON_MANIFEST_KEY_COLS,
+        how="left",
+    )
+    inventory["completed_now"] = inventory["completed_now"].fillna(False).astype(bool)
+    inventory["notebook"] = str(notebook)
+    inventory["layer"] = str(layer)
+    inventory["source_dir"] = source_path
+    inventory["model_family_scope"] = inventory["model_family"].astype(str)
+    inventory["building_scope"] = inventory["building"].astype(str)
+    inventory["seed"] = pd.NA
+    inventory["target_kind"] = "comparison"
+    inventory["status"] = np.where(inventory["completed_now"], "complete", "missing")
+    inventory["desired_full_matrix"] = True
+    inventory["notes"] = np.where(
+        inventory["completed_now"],
+        "Present in the current comparison manifest.",
+        "Missing from the current comparison manifest; safe to schedule for resume-only execution.",
+    )
+    ordered_cols = [
+        "notebook",
+        "layer",
+        "source_dir",
+        "model_family_scope",
+        "regime",
+        "building_scope",
+        "mode",
+        "weather_mode",
+        "horizon_h",
+        "seed",
+        "target_kind",
+        "status",
+        "completed_now",
+        "desired_full_matrix",
+        "notes",
+        "building",
+        "model_family",
+        "run_id",
+    ]
+    return inventory.loc[:, ordered_cols].sort_values(
+        ["regime", "building_scope", "model_family_scope", "mode", "weather_mode", "horizon_h"]
+    ).reset_index(drop=True)
+
+
+def comparison_manifest_overlap_report(
+    subset_manifest_df: pd.DataFrame,
+    superset_manifest_df: pd.DataFrame,
+    *,
+    subset_label: str,
+    superset_label: str,
+) -> pd.DataFrame:
+    subset = _normalize_comparison_manifest_frame(subset_manifest_df)
+    superset = _normalize_comparison_manifest_frame(superset_manifest_df)
+    missing = build_missing_comparison_manifest(subset, superset)
+    return pd.DataFrame(
+        [
+            {
+                "subset_label": str(subset_label),
+                "superset_label": str(superset_label),
+                "subset_rows": int(len(subset)),
+                "superset_rows": int(len(superset)),
+                "missing_rows": int(len(missing)),
+                "is_subset": bool(missing.empty),
+            }
+        ]
+    )
+
+
+def _completed_comparison_slots(
+    outputs: ComparisonOutputs,
+    config: ExperimentConfig,
+    *,
+    manifest_df: pd.DataFrame | None = None,
+) -> set[str]:
+    metrics_by = _artifact_frames_by_comparison_slot(outputs.comparison_metrics_df)
+    coverage_by = _artifact_frames_by_comparison_slot(outputs.comparison_coverage_df)
+    pred_by = _artifact_frames_by_comparison_slot(outputs.comparison_predictions_df)
+    run_by = _artifact_frames_by_comparison_slot(outputs.run_log_df)
+
+    completed_slots: set[str] = set()
+    pair_plan_df = _comparison_pair_plan_df(config, manifest_df=manifest_df)
+    for row in pair_plan_df.itertuples(index=False):
+        slot_id = _comparison_slot_id(
+            str(row.regime),
+            str(row.building),
+            str(row.mode),
+            str(row.weather_mode),
+            int(row.horizon_h),
+        )
+        if _pair_slices_complete(
+            metrics_by.get(slot_id, pd.DataFrame()),
+            coverage_by.get(slot_id, pd.DataFrame()),
+            pred_by.get(slot_id, pd.DataFrame()),
+            run_by.get(slot_id, pd.DataFrame()),
+            config,
+            regime=str(row.regime),
+        ):
+            completed_slots.add(slot_id)
+    return completed_slots
+
+
 def _csv_data_row_count(path: Path) -> int:
     if not path.exists():
         return 0
@@ -552,7 +1303,11 @@ def _csv_data_row_count(path: Path) -> int:
     return max(0, n_lines - 1)
 
 
-def print_resume_diagnostics(config: ExperimentConfig) -> None:
+def print_resume_diagnostics(
+    config: ExperimentConfig,
+    *,
+    manifest_df: pd.DataFrame | None = None,
+) -> None:
     """Print where artifacts live, CSV sizes, and pair-level resume progress (fast path)."""
     paths = ensure_results_dirs(config)
     print("--- resume diagnostics ---")
@@ -562,43 +1317,44 @@ def print_resume_diagnostics(config: ExperimentConfig) -> None:
         p = paths[key]
         print(f"  {paths[key].name}: exists={p.exists()} data_rows={_csv_data_row_count(p)}")
 
-    manifest_df = build_comparison_manifest(config)
-    outputs = load_saved_outputs(config, manifest_df=manifest_df)
+    manifest_scope_df = manifest_df.copy() if manifest_df is not None else build_comparison_manifest(config)
+    outputs = load_saved_outputs(config, manifest_df=manifest_scope_df)
     metrics_by = _artifact_frames_by_comparison_slot(outputs.comparison_metrics_df)
     coverage_by = _artifact_frames_by_comparison_slot(outputs.comparison_coverage_df)
     pred_by = _artifact_frames_by_comparison_slot(outputs.comparison_predictions_df)
     run_by = _artifact_frames_by_comparison_slot(outputs.run_log_df)
 
-    total_pairs = sum(
-        (len(config.buildings) if regime == "per_building" else 1)
-        * len(config.modes)
-        * len(config.weather_modes)
-        * len(config.horizons)
-        for regime in config.regimes
-    )
+    pair_plan_df = _comparison_pair_plan_df(config, manifest_df=manifest_scope_df)
+    total_pairs = int(len(pair_plan_df))
     n_complete = 0
     first_bad: tuple[int, str, str, str, str, int] | None = None
-    idx = 0
-    for regime in config.regimes:
-        scope_buildings = config.buildings if regime == "per_building" else ("POOLED",)
-        for scope_building in scope_buildings:
-            for mode in config.modes:
-                for weather_mode in config.weather_modes:
-                    for horizon_h in config.horizons:
-                        idx += 1
-                        sid = _comparison_slot_id(regime, scope_building, mode, weather_mode, int(horizon_h))
-                        ok = _pair_slices_complete(
-                            metrics_by.get(sid, pd.DataFrame()),
-                            coverage_by.get(sid, pd.DataFrame()),
-                            pred_by.get(sid, pd.DataFrame()),
-                            run_by.get(sid, pd.DataFrame()),
-                            config,
-                            regime=regime,
-                        )
-                        if ok:
-                            n_complete += 1
-                        elif first_bad is None:
-                            first_bad = (idx, regime, scope_building, mode, weather_mode, int(horizon_h))
+    for idx, row in enumerate(pair_plan_df.itertuples(index=False), start=1):
+        sid = _comparison_slot_id(
+            str(row.regime),
+            str(row.building),
+            str(row.mode),
+            str(row.weather_mode),
+            int(row.horizon_h),
+        )
+        ok = _pair_slices_complete(
+            metrics_by.get(sid, pd.DataFrame()),
+            coverage_by.get(sid, pd.DataFrame()),
+            pred_by.get(sid, pd.DataFrame()),
+            run_by.get(sid, pd.DataFrame()),
+            config,
+            regime=str(row.regime),
+        )
+        if ok:
+            n_complete += 1
+        elif first_bad is None:
+            first_bad = (
+                idx,
+                str(row.regime),
+                str(row.building),
+                str(row.mode),
+                str(row.weather_mode),
+                int(row.horizon_h),
+            )
     print(f"pair slots complete: {n_complete}/{total_pairs} (same rules as pair_is_complete)")
     if first_bad is None:
         print("first incomplete slot: (none — all pairs complete)")
@@ -649,6 +1405,7 @@ def _upsert_pair_outputs(
     run_log_df: pd.DataFrame,
     lstm_history_df: pd.DataFrame,
     xgb_history_df: pd.DataFrame,
+    normalize: bool = True,
 ) -> ComparisonOutputs:
     cleared = _drop_pair_rows(
         outputs,
@@ -668,7 +1425,7 @@ def _upsert_pair_outputs(
         lstm_training_history_df=_append_frame(cleared.lstm_training_history_df, lstm_history_df),
         xgb_eval_history_df=_append_frame(cleared.xgb_eval_history_df, xgb_history_df),
     )
-    return _normalize_outputs(updated)
+    return _normalize_outputs(updated) if normalize else updated
 
 
 def run_id_from_spec(run_spec: RunSpec) -> str:
@@ -776,17 +1533,17 @@ def future_weather_feature_cols(columns: Iterable[str], horizon_h: int) -> list[
 
 
 def apply_weather_mode(frame: pd.DataFrame, weather_mode: str, horizon_h: int) -> tuple[pd.DataFrame, list[str]]:
-    out = frame.copy()
     if weather_mode == "FW0":
-        return out, []
+        return frame, []
 
-    fw_cols = future_weather_feature_cols(out.columns, horizon_h)
+    fw_cols = future_weather_feature_cols(frame.columns, horizon_h)
     if weather_mode == "FW2":
         if not fw_cols:
             raise KeyError(f"No proxy future-weather columns found for horizon {horizon_h}")
-        return out, fw_cols
+        return frame, fw_cols
 
     if weather_mode == "FW1":
+        out = frame.copy()
         oracle_cols = build_oracle_future_weather_columns(out, horizon_h)
         for col_name, values in oracle_cols.items():
             out[col_name] = values
@@ -859,15 +1616,16 @@ def require_tensorflow() -> None:
         raise ImportError("TensorFlow/Keras is not available in the current environment.")
 
 
-def set_all_seeds(seed: int) -> None:
+def set_all_seeds(seed: int, *, deterministic_ops: bool = True) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     if tf is not None:
         tf.random.set_seed(seed)
-        try:
-            tf.config.experimental.enable_op_determinism()
-        except Exception:
-            pass
+        if deterministic_ops:
+            try:
+                tf.config.experimental.enable_op_determinism()
+            except Exception:
+                pass
 
 
 def validate_feature_contract(
@@ -1033,6 +1791,7 @@ def run_sanity_check(
                 epochs=1,
                 early_stopping_patience=max(1, min(config.early_stopping_patience, 2)),
                 learning_rate=config.learning_rate,
+                deterministic_ops=config.deterministic_ops,
                 model_families=config.model_families,
             )
             try:
@@ -1244,37 +2003,50 @@ def build_sequences(
     split_mask: pd.Series | np.ndarray,
     lookback: int,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    X_list: list[np.ndarray] = []
-    y_list: list[float] = []
-    meta_rows: list[dict[str, Any]] = []
+    lookback = int(lookback)
     mask = np.asarray(split_mask, dtype=bool)
-    heating = heating_mask(df_scaled)
-    for end_idx in range(int(lookback), len(df_scaled)):
-        if not mask[end_idx]:
-            continue
-        start_idx = end_idx - int(lookback)
-        if not mask[start_idx:end_idx].all():
-            continue
-        window = df_scaled.iloc[start_idx:end_idx]
-        target_val = df_scaled.iloc[end_idx][target_col]
-        if window[dynamic_cols].isna().any().any() or pd.isna(target_val):
-            continue
-        X_list.append(window[dynamic_cols].values.astype("float32"))
-        y_list.append(float(target_val))
-        meta_rows.append(
-            {
-                "building": str(df_scaled.iloc[end_idx]["building"]),
-                "datetime": pd.Timestamp(df_scaled.iloc[end_idx]["datetime"]),
-                "is_heating_eval": bool(heating.iloc[end_idx]),
-            }
-        )
-    if not X_list:
+    n_rows = len(df_scaled)
+    if n_rows <= lookback:
         return (
-            np.empty((0, int(lookback), len(dynamic_cols)), dtype="float32"),
+            np.empty((0, lookback, len(dynamic_cols)), dtype="float32"),
             np.empty((0,), dtype="float32"),
             pd.DataFrame(columns=["building", "datetime", "is_heating_eval"]),
         )
-    return np.stack(X_list, axis=0), np.array(y_list, dtype="float32"), pd.DataFrame(meta_rows)
+
+    dynamic_values = df_scaled.loc[:, dynamic_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32", copy=False)
+    target_values = pd.to_numeric(df_scaled[target_col], errors="coerce").to_numpy(dtype=float)
+    heating_values = heating_mask(df_scaled).to_numpy(dtype=bool)
+    building_values = df_scaled["building"].astype(str).to_numpy()
+    datetime_values = pd.to_datetime(df_scaled["datetime"]).to_numpy()
+
+    end_indices = np.arange(lookback, n_rows, dtype=int)
+    current_mask = mask[end_indices]
+    target_valid = np.isfinite(target_values[end_indices])
+
+    row_valid = np.isfinite(dynamic_values).all(axis=1)
+    history_mask_valid = np.lib.stride_tricks.sliding_window_view(mask, lookback)[: n_rows - lookback].all(axis=1)
+    history_feature_valid = np.lib.stride_tricks.sliding_window_view(row_valid, lookback)[: n_rows - lookback].all(axis=1)
+    valid_endpoints = current_mask & target_valid & history_mask_valid & history_feature_valid
+
+    if not valid_endpoints.any():
+        return (
+            np.empty((0, lookback, len(dynamic_cols)), dtype="float32"),
+            np.empty((0,), dtype="float32"),
+            pd.DataFrame(columns=["building", "datetime", "is_heating_eval"]),
+        )
+
+    sequence_windows = np.lib.stride_tricks.sliding_window_view(dynamic_values, lookback, axis=0)[: n_rows - lookback]
+    sequence_windows = np.transpose(sequence_windows, (0, 2, 1))
+    X = np.ascontiguousarray(sequence_windows[valid_endpoints], dtype="float32")
+    y = target_values[end_indices][valid_endpoints].astype("float32", copy=False)
+    meta_df = pd.DataFrame(
+        {
+            "building": building_values[end_indices][valid_endpoints],
+            "datetime": pd.to_datetime(datetime_values[end_indices][valid_endpoints]),
+            "is_heating_eval": heating_values[end_indices][valid_endpoints],
+        }
+    )
+    return X, y, meta_df
 
 
 def build_xgb_model_frames(
@@ -1519,7 +2291,7 @@ def _run_lstm_regime(
     static_scaler: StandardScaler,
 ) -> tuple[TrainingArtifacts, pd.DataFrame]:
     require_tensorflow()
-    set_all_seeds(config.random_seed)
+    set_all_seeds(config.random_seed, deterministic_ops=config.deterministic_ops)
     tf.keras.backend.clear_session()
 
     spec = architecture_spec(config)
@@ -2136,6 +2908,7 @@ def _build_pair_error_log(
 def run_full_comparison(
     config: ExperimentConfig,
     *,
+    manifest_df: pd.DataFrame | None = None,
     save_artifacts: bool = True,
     verbose: bool = True,
     resume_existing: bool = True,
@@ -2150,148 +2923,152 @@ def run_full_comparison(
         raise ValueError(f"Feature contract failed for one or more buildings:\n{failures.to_string(index=False)}")
 
     static_scaler = fit_static_scaler(config, base_frames)
-    manifest_df = build_comparison_manifest(config)
-    outputs = load_saved_outputs(config, manifest_df=manifest_df) if resume_existing else ComparisonOutputs(manifest_df=manifest_df.copy())
-    outputs.manifest_df = manifest_df.copy()
+    manifest_scope_df = (
+        _normalize_comparison_manifest_frame(manifest_df)
+        if manifest_df is not None
+        else build_comparison_manifest(config)
+    )
+    outputs = (
+        load_saved_outputs(config, manifest_df=manifest_scope_df)
+        if resume_existing
+        else ComparisonOutputs(manifest_df=manifest_scope_df.copy())
+    )
+    outputs.manifest_df = manifest_scope_df.copy()
     outputs = _normalize_outputs(outputs)
+    completed_slots = _completed_comparison_slots(outputs, config, manifest_df=manifest_scope_df)
 
     if save_artifacts:
         _write_outputs(paths, outputs)
 
-    total_pairs = sum((len(config.buildings) if regime == "per_building" else 1) * len(config.modes) * len(config.weather_modes) * len(config.horizons) for regime in config.regimes)
-    completed = 0
+    pair_plan_df = _comparison_pair_plan_df(config, manifest_df=manifest_scope_df)
+    total_pairs = int(len(pair_plan_df))
 
-    for regime in config.regimes:
-        scope_buildings = config.buildings if regime == "per_building" else ("POOLED",)
-        for scope_building in scope_buildings:
-            for mode in config.modes:
-                for weather_mode in config.weather_modes:
-                    for horizon_h in config.horizons:
-                        completed += 1
-                        if pair_is_complete(
-                            outputs,
-                            config,
-                            regime=regime,
-                            scope_building=scope_building,
-                            mode=mode,
-                            weather_mode=weather_mode,
-                            horizon_h=int(horizon_h),
-                        ):
-                            if verbose:
-                                print(
-                                    f"[{completed:>3}/{total_pairs}] regime={regime} scope={scope_building} "
-                                    f"mode={mode} weather={weather_mode} h={int(horizon_h)} | resume-skip"
-                                )
-                            continue
-                        if verbose:
-                            print(
-                                f"[{completed:>3}/{total_pairs}] regime={regime} scope={scope_building} "
-                                f"mode={mode} weather={weather_mode} h={int(horizon_h)}"
-                            )
-                        pair_config = config if regime != "per_building" else ExperimentConfig(
-                            buildings=(scope_building,),
-                            horizons=config.horizons,
-                            regimes=(regime,),
-                            weather_modes=config.weather_modes,
-                            modes=config.modes,
-                            train_end=config.train_end,
-                            test_start=config.test_start,
-                            lookback_hours=config.lookback_hours,
-                            validation_fraction=config.validation_fraction,
-                            results_dir=config.results_dir,
-                            lstm_architecture_id=config.lstm_architecture_id,
-                            xgb_preset_id=config.xgb_preset_id,
-                            random_seed=config.random_seed,
-                            batch_size=config.batch_size,
-                            epochs=config.epochs,
-                            early_stopping_patience=config.early_stopping_patience,
-                            learning_rate=config.learning_rate,
-                            model_families=config.model_families,
-                        )
-                        pair_base_frames = base_frames if regime != "per_building" else {scope_building: base_frames[scope_building]}
-                        pair_static_scaler = static_scaler
-                        pair_start = perf_counter()
-                        try:
-                            lstm_artifacts, lstm_log = _run_lstm_regime(
-                                config=pair_config,
-                                regime=regime,
-                                mode=mode,
-                                weather_mode=weather_mode,
-                                horizon_h=int(horizon_h),
-                                base_frames=pair_base_frames,
-                                static_scaler=pair_static_scaler,
-                            )
-                            xgb_artifacts, xgb_log = _run_xgb_regime(
-                                config=pair_config,
-                                regime=regime,
-                                mode=mode,
-                                weather_mode=weather_mode,
-                                horizon_h=int(horizon_h),
-                                base_frames=pair_base_frames,
-                            )
-                            aligned_pred_df, metrics_df, coverage_df = _align_predictions_and_metrics(
-                                config=pair_config,
-                                regime=regime,
-                                mode=mode,
-                                weather_mode=weather_mode,
-                                horizon_h=int(horizon_h),
-                                lstm_artifacts=lstm_artifacts,
-                                xgb_artifacts=xgb_artifacts,
-                            )
-                            outputs = _upsert_pair_outputs(
-                                outputs,
-                                regime=regime,
-                                scope_building=scope_building,
-                                mode=mode,
-                                weather_mode=weather_mode,
-                                horizon_h=int(horizon_h),
-                                predictions_df=aligned_pred_df,
-                                metrics_df=metrics_df,
-                                coverage_df=coverage_df,
-                                run_log_df=pd.concat([lstm_log, xgb_log], ignore_index=True),
-                                lstm_history_df=lstm_artifacts.history_df,
-                                xgb_history_df=xgb_artifacts.history_df,
-                            )
-                        except Exception as exc:
-                            error_log_df = _build_pair_error_log(
-                                regime=regime,
-                                scope_building=scope_building,
-                                mode=mode,
-                                weather_mode=weather_mode,
-                                horizon_h=int(horizon_h),
-                                elapsed_s=float(perf_counter() - pair_start),
-                                error=exc,
-                            )
-                            outputs = _upsert_pair_outputs(
-                                outputs,
-                                regime=regime,
-                                scope_building=scope_building,
-                                mode=mode,
-                                weather_mode=weather_mode,
-                                horizon_h=int(horizon_h),
-                                predictions_df=pd.DataFrame(),
-                                metrics_df=pd.DataFrame(),
-                                coverage_df=pd.DataFrame(),
-                                run_log_df=error_log_df,
-                                lstm_history_df=pd.DataFrame(),
-                                xgb_history_df=pd.DataFrame(),
-                            )
-                            if save_artifacts and save_after_each_pair:
-                                _write_outputs(paths, outputs)
-                            if verbose:
-                                print(
-                                    f"    pair failed | regime={regime} scope={scope_building} "
-                                    f"mode={mode} weather={weather_mode} h={int(horizon_h)} | {type(exc).__name__}: {exc}"
-                                )
-                            if not continue_on_error:
-                                raise
-                            continue
+    for completed, row in enumerate(pair_plan_df.itertuples(index=False), start=1):
+        regime = str(row.regime)
+        scope_building = str(row.building)
+        mode = str(row.mode)
+        weather_mode = str(row.weather_mode)
+        horizon_h = int(row.horizon_h)
+        slot_id = _comparison_slot_id(regime, scope_building, mode, weather_mode, horizon_h)
+        if slot_id in completed_slots:
+            if verbose:
+                print(
+                    f"[{completed:>3}/{total_pairs}] regime={regime} scope={scope_building} "
+                    f"mode={mode} weather={weather_mode} h={horizon_h} | resume-skip"
+                )
+            continue
+        if verbose:
+            print(
+                f"[{completed:>3}/{total_pairs}] regime={regime} scope={scope_building} "
+                f"mode={mode} weather={weather_mode} h={horizon_h}"
+            )
+        pair_buildings = (scope_building,) if regime == "per_building" else tuple(config.buildings)
+        pair_config = clone_experiment_config(
+            config,
+            buildings=pair_buildings,
+            horizons=(horizon_h,),
+            regimes=(regime,),
+            weather_modes=(weather_mode,),
+            modes=(mode,),
+        )
+        pair_base_frames = base_frames if regime != "per_building" else {scope_building: base_frames[scope_building]}
+        pair_static_scaler = static_scaler
+        pair_start = perf_counter()
+        try:
+            lstm_artifacts, lstm_log = _run_lstm_regime(
+                config=pair_config,
+                regime=regime,
+                mode=mode,
+                weather_mode=weather_mode,
+                horizon_h=horizon_h,
+                base_frames=pair_base_frames,
+                static_scaler=pair_static_scaler,
+            )
+            xgb_artifacts, xgb_log = _run_xgb_regime(
+                config=pair_config,
+                regime=regime,
+                mode=mode,
+                weather_mode=weather_mode,
+                horizon_h=horizon_h,
+                base_frames=pair_base_frames,
+            )
+            aligned_pred_df, metrics_df, coverage_df = _align_predictions_and_metrics(
+                config=pair_config,
+                regime=regime,
+                mode=mode,
+                weather_mode=weather_mode,
+                horizon_h=horizon_h,
+                lstm_artifacts=lstm_artifacts,
+                xgb_artifacts=xgb_artifacts,
+            )
+            outputs = _upsert_pair_outputs(
+                outputs,
+                regime=regime,
+                scope_building=scope_building,
+                mode=mode,
+                weather_mode=weather_mode,
+                horizon_h=horizon_h,
+                predictions_df=aligned_pred_df,
+                metrics_df=metrics_df,
+                coverage_df=coverage_df,
+                run_log_df=pd.concat([lstm_log, xgb_log], ignore_index=True),
+                lstm_history_df=lstm_artifacts.history_df,
+                xgb_history_df=xgb_artifacts.history_df,
+                normalize=False,
+            )
+            if _pair_slices_complete(
+                metrics_df,
+                coverage_df,
+                aligned_pred_df,
+                pd.concat([lstm_log, xgb_log], ignore_index=True),
+                pair_config,
+                regime=regime,
+            ):
+                completed_slots.add(slot_id)
+            else:
+                completed_slots.discard(slot_id)
+        except Exception as exc:
+            error_log_df = _build_pair_error_log(
+                regime=regime,
+                scope_building=scope_building,
+                mode=mode,
+                weather_mode=weather_mode,
+                horizon_h=horizon_h,
+                elapsed_s=float(perf_counter() - pair_start),
+                error=exc,
+            )
+            outputs = _upsert_pair_outputs(
+                outputs,
+                regime=regime,
+                scope_building=scope_building,
+                mode=mode,
+                weather_mode=weather_mode,
+                horizon_h=horizon_h,
+                predictions_df=pd.DataFrame(),
+                metrics_df=pd.DataFrame(),
+                coverage_df=pd.DataFrame(),
+                run_log_df=error_log_df,
+                lstm_history_df=pd.DataFrame(),
+                xgb_history_df=pd.DataFrame(),
+                normalize=False,
+            )
+            completed_slots.discard(slot_id)
+            if save_artifacts and save_after_each_pair:
+                _write_outputs(paths, outputs)
+            if verbose:
+                print(
+                    f"    pair failed | regime={regime} scope={scope_building} "
+                    f"mode={mode} weather={weather_mode} h={horizon_h} | {type(exc).__name__}: {exc}"
+                )
+            if not continue_on_error:
+                raise
+            continue
 
-                        if save_artifacts and save_after_each_pair:
-                            _write_outputs(paths, outputs)
+        if save_artifacts and save_after_each_pair:
+            _write_outputs(paths, outputs)
 
     outputs = _normalize_outputs(outputs)
-    outputs.manifest_df = manifest_df.copy()
+    outputs.manifest_df = manifest_scope_df.copy()
     if save_artifacts:
         _write_outputs(paths, outputs)
     return outputs
