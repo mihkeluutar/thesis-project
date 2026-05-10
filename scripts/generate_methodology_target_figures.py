@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 from pathlib import Path
 import shutil
@@ -33,13 +34,18 @@ def configure_style() -> None:
     plt.style.use("seaborn-v0_8-whitegrid")
     plt.rcParams.update(
         {
-            "figure.dpi": 150,
+            "figure.dpi": 180,
             "savefig.dpi": 300,
-            "axes.titlesize": 15,
-            "axes.labelsize": 12,
-            "xtick.labelsize": 10,
-            "ytick.labelsize": 10,
-            "legend.fontsize": 10,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "axes.labelsize": 9.5,
+            "axes.titlesize": 12.5,
+            "axes.titlepad": 8,
+            "font.size": 9,
+            "xtick.labelsize": 8.5,
+            "ytick.labelsize": 8.5,
+            "legend.fontsize": 8.5,
+            "legend.frameon": False,
         }
     )
 
@@ -124,6 +130,7 @@ def _format_time_axis(ax: plt.Axes) -> None:
     ax.xaxis.set_major_locator(mdates.HourLocator(interval=3))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
     ax.set_xlabel("Forecast timeline")
+    ax.grid(True, color="#d8d8d8", linewidth=0.75, alpha=0.75)
 
 
 def make_trace_example(df: pd.DataFrame) -> plt.Figure:
@@ -165,30 +172,32 @@ def make_point_target_example(df: pd.DataFrame) -> plt.Figure:
     sub = df[(df["datetime"] >= window_start) & (df["datetime"] <= window_end)].copy()
     point_value = float(df.loc[df["datetime"] == point_time, "heat_kwh"].iloc[0])
 
-    fig, ax = plt.subplots(figsize=(11.5, 3.9))
-    ax.plot(sub["datetime"], sub["heat_kwh"], color="#111827", linewidth=2.15)
+    fig, ax = plt.subplots(figsize=(10.2, 3.55))
+    ax.plot(sub["datetime"], sub["heat_kwh"], color="#111111", linewidth=1.65)
 
     ymin = max(0.0, float(sub["heat_kwh"].min()) * 0.88)
     ymax = float(sub["heat_kwh"].max()) * 1.08
     ax.set_ylim(ymin, ymax)
-    ax.axvspan(ISSUE_TIME - pd.Timedelta(hours=LOOKBACK_HOURS), ISSUE_TIME, color="#cbd5e1", alpha=0.45, lw=0)
-    ax.axvline(ISSUE_TIME, color="#b91c1c", linestyle="--", linewidth=1.8)
-    ax.axvline(point_time, color="#2563eb", linestyle=":", linewidth=1.6)
-    ax.scatter([point_time], [point_value], s=80, color="#2563eb", zorder=5)
+    ax.axvspan(ISSUE_TIME - pd.Timedelta(hours=LOOKBACK_HOURS), ISSUE_TIME, color="#cbd5e1", alpha=0.38, lw=0)
+    ax.axvline(ISSUE_TIME, color="#b91c1c", linestyle="--", linewidth=1.4)
+    ax.axvline(point_time, color="#2a6f8f", linestyle=":", linewidth=1.35)
+    ax.scatter([point_time], [point_value], s=46, color="#2a6f8f", zorder=5)
     ax.set_ylabel("Heat demand (kWh)")
     _format_time_axis(ax)
     fig.autofmt_xdate(rotation=25, ha="right")
-    ax.legend(
+    fig.legend(
         handles=[
-            Line2D([0], [0], color="#111827", linewidth=2.15, label="Observed hourly heat demand"),
-            Patch(facecolor="#cbd5e1", edgecolor="none", alpha=0.45, label="Past input window"),
-            Line2D([0], [0], color="#b91c1c", linestyle="--", linewidth=1.8, label="Forecast issue time"),
-            Line2D([0], [0], color="#2563eb", linestyle=":", marker="o", markersize=7, linewidth=1.6, label="Point-horizon target hour"),
+            Line2D([0], [0], color="#111111", linewidth=1.65, label="Observed hourly heat demand"),
+            Patch(facecolor="#cbd5e1", edgecolor="none", alpha=0.38, label="Past input window"),
+            Line2D([0], [0], color="#b91c1c", linestyle="--", linewidth=1.4, label="Forecast issue time"),
+            Line2D([0], [0], color="#2a6f8f", linestyle=":", marker="o", markersize=5, linewidth=1.35, label="Point-horizon target hour"),
         ],
-        loc="upper left",
-        frameon=True,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.99),
+        ncol=4,
+        handlelength=2.4,
     )
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.075, right=0.985, bottom=0.24, top=0.78)
     return fig
 
 def make_cumulative_target_example(df: pd.DataFrame) -> plt.Figure:
@@ -198,30 +207,32 @@ def make_cumulative_target_example(df: pd.DataFrame) -> plt.Figure:
     sub = df[(df["datetime"] >= window_start) & (df["datetime"] <= window_end)].copy()
     fill_df = df[(df["datetime"] >= ISSUE_TIME) & (df["datetime"] <= cumulative_end)].copy()
 
-    fig, ax = plt.subplots(figsize=(11.5, 3.9))
-    ax.plot(sub["datetime"], sub["heat_kwh"], color="#111827", linewidth=2.15)
+    fig, ax = plt.subplots(figsize=(10.2, 3.55))
+    ax.plot(sub["datetime"], sub["heat_kwh"], color="#111111", linewidth=1.65)
 
     ymin = max(0.0, float(sub["heat_kwh"].min()) * 0.88)
     ymax = float(sub["heat_kwh"].max()) * 1.08
     ax.set_ylim(ymin, ymax)
-    ax.axvspan(ISSUE_TIME - pd.Timedelta(hours=LOOKBACK_HOURS), ISSUE_TIME, color="#cbd5e1", alpha=0.45, lw=0)
-    ax.axvline(ISSUE_TIME, color="#b91c1c", linestyle="--", linewidth=1.8)
-    ax.axvspan(ISSUE_TIME, cumulative_end, color="#fdba74", alpha=0.22, lw=0)
-    ax.fill_between(fill_df["datetime"], 0, fill_df["heat_kwh"], color="#fb923c", alpha=0.30)
+    ax.axvspan(ISSUE_TIME - pd.Timedelta(hours=LOOKBACK_HOURS), ISSUE_TIME, color="#cbd5e1", alpha=0.38, lw=0)
+    ax.axvline(ISSUE_TIME, color="#b91c1c", linestyle="--", linewidth=1.4)
+    ax.axvspan(ISSUE_TIME, cumulative_end, color="#fdba74", alpha=0.18, lw=0)
+    ax.fill_between(fill_df["datetime"], 0, fill_df["heat_kwh"], color="#c46a2d", alpha=0.24)
     ax.set_ylabel("Heat demand (kWh)")
     _format_time_axis(ax)
     fig.autofmt_xdate(rotation=25, ha="right")
-    ax.legend(
+    fig.legend(
         handles=[
-            Line2D([0], [0], color="#111827", linewidth=2.15, label="Observed hourly heat demand"),
-            Patch(facecolor="#cbd5e1", edgecolor="none", alpha=0.45, label="Past input window"),
-            Line2D([0], [0], color="#b91c1c", linestyle="--", linewidth=1.8, label="Forecast issue time"),
-            Patch(facecolor="#fb923c", edgecolor="none", alpha=0.30, label="Cumulative target window"),
+            Line2D([0], [0], color="#111111", linewidth=1.65, label="Observed hourly heat demand"),
+            Patch(facecolor="#cbd5e1", edgecolor="none", alpha=0.38, label="Past input window"),
+            Line2D([0], [0], color="#b91c1c", linestyle="--", linewidth=1.4, label="Forecast issue time"),
+            Patch(facecolor="#c46a2d", edgecolor="none", alpha=0.24, label="Cumulative target window"),
         ],
-        loc="upper left",
-        frameon=True,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.99),
+        ncol=4,
+        handlelength=2.4,
     )
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.075, right=0.985, bottom=0.24, top=0.78)
     return fig
 
 
@@ -289,27 +300,43 @@ def make_schematic_example(semantics_df: pd.DataFrame) -> plt.Figure:
     return fig
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Render methodology target figures.")
+    parser.add_argument(
+        "--figure",
+        choices=["all", "point", "cumulative"],
+        default="all",
+        help="Restrict rendering to the thesis-referenced cumulative figure when desired.",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     configure_style()
     trace_df = load_trace()
 
-    save_figure(make_point_target_example(trace_df), "methodology_target_point_example.png")
-    save_figure(make_cumulative_target_example(trace_df), "methodology_target_cumulative_example.png")
-
-    manifest = pd.DataFrame(
-        [
+    manifest_rows = []
+    if args.figure in {"all", "point"}:
+        save_figure(make_point_target_example(trace_df), "methodology_target_point_example.png")
+        manifest_rows.append(
             {
                 "filename": "methodology_target_point_example.png",
                 "role": "Candidate B1",
                 "description": "Point-horizon target figure with a separate target hour, past input window, and forecast issue time.",
-            },
+            }
+        )
+    if args.figure in {"all", "cumulative"}:
+        save_figure(make_cumulative_target_example(trace_df), "methodology_target_cumulative_example.png")
+        manifest_rows.append(
             {
                 "filename": "methodology_target_cumulative_example.png",
                 "role": "Candidate B2",
                 "description": "Cumulative-target figure with the same forecast issue time and a shaded future demand window.",
-            },
-        ]
-    )
+            }
+        )
+
+    manifest = pd.DataFrame(manifest_rows)
     manifest.to_csv(RESULTS_DIR / "methodology_target_figures_manifest.csv", index=False)
 
 

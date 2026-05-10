@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
+os.environ.setdefault("MPLCONFIGDIR", str((Path(__file__).resolve().parent.parent / ".mplconfig")))
+
 import matplotlib.lines as mlines
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import pandas as pd
@@ -31,8 +35,22 @@ FIGURES_DIR = THESIS_ROOT / "masters-thesis" / "figures"
 TRAIN_TEST_SPLIT = pd.Timestamp("2024-01-01")
 WEATHER_CLEAN_CSV = PROJECT_ROOT / "data" / "clean" / "weather_hourly_clean.csv"
 U05_CLEAN_CSV = PROJECT_ROOT / "data" / "clean" / "U05_hourly_clean.csv"
+OBSERVED_BUILDING_CSVS = {
+    "U05": PROJECT_ROOT / "data" / "clean" / "U05_hourly_clean.csv",
+    "U06": PROJECT_ROOT / "data" / "clean" / "U06_hourly_clean.csv",
+    "LIB": PROJECT_ROOT / "data" / "clean" / "LIB_hourly_clean.csv",
+    "U02B": PROJECT_ROOT / "data" / "clean" / "U02B_hourly_clean.csv",
+    "SOC": PROJECT_ROOT / "data" / "clean" / "SOC_hourly_clean.csv",
+    "U03": PROJECT_ROOT / "data" / "clean" / "U03_hourly_clean.csv",
+}
 BASELINE_POINT_SUMMARY_CSV = PROJECT_ROOT / "results" / "baseline_point_horizon_summary.csv"
 BASELINE_POINT_TRACE_CSV = PROJECT_ROOT / "results" / "baseline_point_horizon_U05_trace_weeks.csv"
+BAYES_RESULTS_DIR = PROJECT_ROOT / "results" / "bayesian_es_baselines_20042026"
+BAYES_ANALYSIS_DIR = BAYES_RESULTS_DIR / "analysis"
+BAYES_FW2_BASELINE_WAPE_CSV = BAYES_ANALYSIS_DIR / "fw2_baseline_wape_summary.csv"
+BAYES_FW2_BEST_VS_NONLINEAR_M4_WAPE_CSV = (
+    BAYES_ANALYSIS_DIR / "fw2_best_baseline_vs_nonlinear_m4_wape.csv"
+)
 BASE_COMPARISON_CSV = (
     PROJECT_ROOT
     / "results"
@@ -46,6 +64,13 @@ BASE_CONTEXT_CSV = (
     / "report_ready_20260405"
     / "model_family_base"
     / "rmse_load_context_per_building.csv"
+)
+MODEL_FAMILY_COMPARISON_CSV = (
+    PROJECT_ROOT
+    / "results"
+    / "report_ready_20260405"
+    / "model_family"
+    / "comparison_summary.csv"
 )
 SUPPLEMENT_PREDICTIONS_CSV = (
     PROJECT_ROOT
@@ -84,6 +109,8 @@ XAI_GROUP_SHARE_FINE_CSV = (
 )
 
 HORIZONS = [1, 2, 4, 6, 8, 12, 16, 20, 24, 36]
+HORIZON_POSITIONS = list(range(len(HORIZONS)))
+HORIZON_POSITION_MAP = {h: idx for idx, h in enumerate(HORIZONS)}
 BASELINE_POINT_HORIZONS = [1, 3, 4, 6, 8]
 BASELINE_MODEL_ORDER = [
     "Persistence_1h",
@@ -123,6 +150,51 @@ WEATHER_COLORS = {
     "FW0": "#8c510a",
     "FW2": "#1b9e77",
     "FW1": "#5e3c99",
+}
+MODEL_FAMILY_COLORS = {
+    "LSTM": "#c46a2d",
+    "XGBoost": "#2a6f8f",
+}
+MODEL_FAMILY_MARKERS = {
+    "LSTM": "o",
+    "XGBoost": "s",
+}
+BAYES_BASELINE_ORDER = ["Bayes_ES", "Bayes_ARX_ES", "Bayes_ARMAX_ES"]
+BAYES_BASELINE_LABELS = {
+    "Bayes_ES": "Bayes ES",
+    "Bayes_ARX_ES": "Bayes ARX-ES",
+    "Bayes_ARMAX_ES": "Bayes ARMAX-ES",
+}
+BAYES_BASELINE_COLORS = {
+    "Bayes_ES": "#7a7f87",
+    "Bayes_ARX_ES": "#4c78a8",
+    "Bayes_ARMAX_ES": "#c46a2d",
+}
+BAYES_BASELINE_MARKERS = {
+    "Bayes_ES": "o",
+    "Bayes_ARX_ES": "s",
+    "Bayes_ARMAX_ES": "D",
+}
+BAYES_OVERLAY_ORDER = ["Bayes_ARX_ES", "LSTM M4", "XGBOOST M4"]
+BAYES_OVERLAY_LABELS = {
+    "Bayes_ARX_ES": "Bayes ARX-ES",
+    "LSTM M4": "LSTM M4",
+    "XGBOOST M4": "XGBoost M4",
+}
+BAYES_OVERLAY_COLORS = {
+    "Bayes_ARX_ES": "#6c5b7b",
+    "LSTM M4": MODEL_FAMILY_COLORS["LSTM"],
+    "XGBOOST M4": MODEL_FAMILY_COLORS["XGBoost"],
+}
+BAYES_OVERLAY_MARKERS = {
+    "Bayes_ARX_ES": "o",
+    "LSTM M4": "s",
+    "XGBOOST M4": "D",
+}
+BAYES_OVERLAY_LINESTYLES = {
+    "Bayes_ARX_ES": "--",
+    "LSTM M4": "-",
+    "XGBOOST M4": "-",
 }
 FINE_GROUP_ORDER = [
     "demand_signal",
@@ -190,15 +262,23 @@ WRAPPED_GROUP_LABELS = {
 
 
 def apply_style() -> None:
-    sns.set_theme(style="whitegrid", context="talk")
+    sns.set_theme(style="whitegrid", context="paper")
     plt.rcParams.update(
         {
             "figure.dpi": 180,
             "savefig.dpi": 300,
             "axes.spines.top": False,
             "axes.spines.right": False,
+            "axes.labelsize": 9.5,
+            "axes.titlesize": 12.5,
             "axes.titlepad": 10,
+            "font.size": 9,
+            "xtick.labelsize": 8.5,
+            "ytick.labelsize": 8.5,
+            "legend.fontsize": 8.5,
             "legend.frameon": False,
+            "grid.color": "#d8d8d8",
+            "grid.linewidth": 0.75,
         }
     )
 
@@ -245,16 +325,7 @@ def add_baseline_labels(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_panel_label(ax: plt.Axes, text: str) -> None:
-    ax.text(
-        0.03,
-        0.95,
-        text,
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=13,
-        fontweight="bold",
-    )
+    ax.set_title(text, fontsize=13, fontweight="bold", pad=10)
 
 
 def add_heatmap_annotations(
@@ -309,6 +380,90 @@ def add_all_heatmap_labels(
                 fontsize=fontsize,
                 color="white" if is_dark else "#222222",
             )
+
+
+def observed_daily_demand_matrix() -> pd.DataFrame:
+    frames: list[pd.Series] = []
+    for building, path in OBSERVED_BUILDING_CSVS.items():
+        df = pd.read_csv(path, parse_dates=["datetime"])
+        daily = (
+            df.set_index("datetime")["heat_target_mwh"]
+            .resample("D")
+            .sum(min_count=1)
+            .rename(building)
+        )
+        frames.append(daily)
+    return pd.concat(frames, axis=1).sort_index()
+
+
+def plot_observed_temperature_demand_context() -> None:
+    weather = pd.read_csv(WEATHER_CLEAN_CSV, parse_dates=["datetime"])
+    temp_daily = (
+        weather.set_index("datetime")["wx_outdoor_temp_c"]
+        .resample("D")
+        .mean()
+        .sort_index()
+    )
+    demand_daily = observed_daily_demand_matrix().sum(axis=1, min_count=1)
+
+    fig, axes = plt.subplots(2, 1, figsize=(11.2, 6.1), sharex=True)
+    panels = [
+        (axes[0], temp_daily, "Outdoor air temperature", "Temp. (C)", "#2a6f8f"),
+        (axes[1], demand_daily, "Six-building portfolio heat demand", "Demand (MWh/day)", "#c46a2d"),
+    ]
+
+    for ax, series, title, ylabel, color in panels:
+        rolling = series.rolling(14, min_periods=3).mean()
+        ax.plot(series.index, series.values, color="#b8b8b8", linewidth=0.8, alpha=0.65, label="Daily value")
+        ax.plot(rolling.index, rolling.values, color=color, linewidth=2.1, label="14-day rolling mean")
+        ax.axvline(TRAIN_TEST_SPLIT, color="#222222", linestyle="--", linewidth=1.2)
+        ax.grid(True, color="#d8d8d8", linewidth=0.8)
+        ax.set_ylabel(ylabel)
+        ax.tick_params(axis="both", labelsize=10)
+        add_panel_label(ax, title)
+
+    axes[0].legend(loc="upper right", ncol=2, fontsize=10)
+    axes[1].set_xlim(pd.Timestamp("2022-01-01"), pd.Timestamp("2024-12-31"))
+    axes[1].xaxis.set_major_locator(mdates.YearLocator())
+    axes[1].xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    axes[1].set_xlabel("Date")
+    fig.tight_layout()
+    fig.subplots_adjust(left=0.10)
+    fig.savefig(figure_path("observed_temperature_demand_context"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_observed_demand_building_distribution() -> None:
+    daily = observed_daily_demand_matrix()
+    stats = pd.DataFrame(
+        {
+            "min": daily.min(axis=1, skipna=True),
+            "q1": daily.quantile(0.25, axis=1),
+            "median": daily.median(axis=1, skipna=True),
+            "mean": daily.mean(axis=1, skipna=True),
+            "q3": daily.quantile(0.75, axis=1),
+            "max": daily.max(axis=1, skipna=True),
+        }
+    ).rolling(14, min_periods=3).mean()
+
+    fig, ax = plt.subplots(figsize=(11.2, 4.1))
+    ax.fill_between(stats.index, stats["min"], stats["max"], color="#d3d3d3", alpha=0.75, label="Min-max")
+    ax.fill_between(stats.index, stats["q1"], stats["q3"], color="#8a8a8a", alpha=0.85, label="Q1-Q3")
+    ax.plot(stats.index, stats["median"], color="#111111", linewidth=1.9, label="Median")
+    ax.plot(stats.index, stats["mean"], color="#1f77b4", linewidth=2.1, label="Mean")
+    ax.axvline(TRAIN_TEST_SPLIT, color="#222222", linestyle="--", linewidth=1.2, label="2024 test start")
+    ax.set_ylabel("Daily building heat demand (MWh)")
+    ax.set_xlabel("Date")
+    ax.tick_params(axis="both", labelsize=10)
+    ax.set_xlim(pd.Timestamp("2022-01-01"), pd.Timestamp("2024-12-31"))
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.grid(True, color="#d8d8d8", linewidth=0.8)
+    ax.legend(loc="upper right", ncol=5, fontsize=10)
+    fig.tight_layout()
+    fig.subplots_adjust(left=0.10)
+    fig.savefig(figure_path("observed_demand_building_distribution"), bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_baseline_point_horizon_portfolio_curves() -> None:
@@ -609,8 +764,8 @@ def plot_model_family_best_wape(regime: str = "per_building", output_name: str =
     df = pd.read_csv(BASE_COMPARISON_CSV)
     fig, axes = plt.subplots(1, 3, figsize=(13.8, 4.4), sharey=True)
 
-    colors = {"LSTM": "#c66b22", "XGBoost": "#17739f"}
-    markers = {"LSTM": "o", "XGBoost": "s"}
+    colors = MODEL_FAMILY_COLORS
+    markers = MODEL_FAMILY_MARKERS
 
     for ax, weather in zip(axes, WEATHER_ORDER):
         lstm = best_family_rows(df, weather, "lstm", ["M0", "M2", "M4"], regime=regime)
@@ -658,11 +813,11 @@ def plot_model_family_weather_scope_comparison(weather: str) -> None:
     df = pd.read_csv(BASE_COMPARISON_CSV)
     fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.3), sharey=True)
 
-    colors = {"LSTM": "#c66b22", "XGBoost": "#17739f"}
-    markers = {"LSTM": "o", "XGBoost": "s"}
+    colors = MODEL_FAMILY_COLORS
+    markers = MODEL_FAMILY_MARKERS
     scopes = [
         ("per_building", "Per-building"),
-        ("pooled_same_buildings", "Pooled same-buildings"),
+        ("pooled_same_buildings", "Pooled"),
     ]
 
     for ax, (regime, panel_label) in zip(axes, scopes):
@@ -675,9 +830,10 @@ def plot_model_family_weather_scope_comparison(weather: str) -> None:
             ],
             ignore_index=True,
         )
+        plot_df["horizon_pos"] = plot_df["horizon_h"].map(HORIZON_POSITION_MAP)
         sns.lineplot(
             data=plot_df,
-            x="horizon_h",
+            x="horizon_pos",
             y="wape_mean",
             hue="family_label",
             style="family_label",
@@ -691,10 +847,11 @@ def plot_model_family_weather_scope_comparison(weather: str) -> None:
             ax=ax,
             legend=False,
         )
-        ax.set_xticks(HORIZONS)
+        ax.set_xticks(HORIZON_POSITIONS)
+        ax.set_xticklabels([str(h) for h in HORIZONS], fontsize=10)
         ax.set_xlabel("Horizon (h)")
-        ax.set_title(panel_label, fontsize=13.5, fontweight="bold", pad=10)
         ax.grid(True, color="#d8d8d8", linewidth=0.8)
+        add_panel_label(ax, panel_label)
 
     axes[0].set_ylabel("Mean WAPE (%)")
     legend_handles = [
@@ -707,13 +864,137 @@ def plot_model_family_weather_scope_comparison(weather: str) -> None:
     plt.close(fig)
 
 
+def plot_model_family_weather_regime_grid() -> None:
+    df = pd.read_csv(MODEL_FAMILY_COMPARISON_CSV)
+    df["horizon_h"] = df["horizon_h"].astype(int)
+    df["horizon_pos"] = df["horizon_h"].map(HORIZON_POSITION_MAP)
+    scopes = [
+        ("per_building", "Per-building"),
+        ("pooled_same_buildings", "Pooled same-buildings"),
+    ]
+    families = [("lstm", "LSTM"), ("xgboost", "XGBoost")]
+
+    fig, axes = plt.subplots(2, 3, figsize=(12.4, 6.4), sharex=True, sharey=True)
+    for row_idx, (regime, scope_label) in enumerate(scopes):
+        for col_idx, weather in enumerate(WEATHER_ORDER):
+            ax = axes[row_idx, col_idx]
+            for family, family_label in families:
+                subset = df[
+                    (df["regime"] == regime)
+                    & (df["weather_mode"] == weather)
+                    & (df["model_family"] == family)
+                ].copy()
+                best = (
+                    subset.sort_values(["horizon_h", "wape_mean", "rmse_mean"])
+                    .groupby("horizon_h", as_index=False)
+                    .first()
+                    .sort_values("horizon_h")
+                )
+                ax.plot(
+                    best["horizon_pos"],
+                    best["wape_mean"],
+                    color=MODEL_FAMILY_COLORS[family_label],
+                    marker=MODEL_FAMILY_MARKERS[family_label],
+                    linewidth=2.1,
+                    markersize=5.4,
+                    label=family_label,
+                )
+            ax.set_xticks(HORIZON_POSITIONS)
+            ax.set_xticklabels([str(h) for h in HORIZONS], fontsize=9)
+            ax.tick_params(axis="both", labelsize=9)
+            ax.grid(True, color="#d8d8d8", linewidth=0.8)
+            title = f"{scope_label}; {weather}"
+            add_panel_label(ax, title)
+            ax.set_xlabel("")
+            ax.set_ylabel("")
+
+    legend_handles = [
+        mlines.Line2D([], [], color=MODEL_FAMILY_COLORS["LSTM"], marker=MODEL_FAMILY_MARKERS["LSTM"], linewidth=2.1, label="LSTM"),
+        mlines.Line2D([], [], color=MODEL_FAMILY_COLORS["XGBoost"], marker=MODEL_FAMILY_MARKERS["XGBoost"], linewidth=2.1, label="XGBoost"),
+    ]
+    fig.legend(legend_handles, [h.get_label() for h in legend_handles], loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.02), fontsize=11)
+    fig.supxlabel("Horizon (h)", fontsize=12)
+    fig.supylabel("Best-mode WAPE (%)", fontsize=12)
+    fig.tight_layout(rect=(0.03, 0.03, 1, 0.95))
+    fig.savefig(figure_path("model_family_weather_regime_grid"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_model_family_weather_regime_pair(weather: str, output_name: str) -> None:
+    df = pd.read_csv(MODEL_FAMILY_COMPARISON_CSV)
+    df["horizon_h"] = df["horizon_h"].astype(int)
+    df["horizon_pos"] = df["horizon_h"].map(HORIZON_POSITION_MAP)
+    scopes = [
+        ("per_building", "Per-building"),
+        ("pooled_same_buildings", "Pooled same-buildings"),
+    ]
+    families = [("lstm", "LSTM"), ("xgboost", "XGBoost")]
+
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.25), sharey=True)
+    for ax, (regime, scope_label) in zip(axes, scopes):
+        for family, family_label in families:
+            subset = df[
+                (df["regime"] == regime)
+                & (df["weather_mode"] == weather)
+                & (df["model_family"] == family)
+            ].copy()
+            best = (
+                subset.sort_values(["horizon_h", "wape_mean", "rmse_mean"])
+                .groupby("horizon_h", as_index=False)
+                .first()
+                .sort_values("horizon_h")
+            )
+            ax.plot(
+                best["horizon_pos"],
+                best["wape_mean"],
+                color=MODEL_FAMILY_COLORS[family_label],
+                marker=MODEL_FAMILY_MARKERS[family_label],
+                linewidth=2.2,
+                markersize=6.0,
+                label=family_label,
+            )
+        ax.set_xticks(HORIZON_POSITIONS)
+        ax.set_xticklabels([str(h) for h in HORIZONS], fontsize=10)
+        ax.set_xlabel("Horizon (h)")
+        ax.grid(True, color="#d8d8d8", linewidth=0.8)
+        add_panel_label(ax, scope_label)
+
+    axes[0].set_ylabel("Best-mode WAPE (%)")
+    legend_handles = [
+        mlines.Line2D([], [], color=MODEL_FAMILY_COLORS["LSTM"], marker=MODEL_FAMILY_MARKERS["LSTM"], linewidth=2.2, label="LSTM"),
+        mlines.Line2D([], [], color=MODEL_FAMILY_COLORS["XGBoost"], marker=MODEL_FAMILY_MARKERS["XGBoost"], linewidth=2.2, label="XGBoost"),
+    ]
+    fig.legend(
+        legend_handles,
+        [h.get_label() for h in legend_handles],
+        loc="upper center",
+        ncol=2,
+        bbox_to_anchor=(0.5, 1.03),
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(figure_path(output_name), bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_model_family_weather_regime_fw0() -> None:
+    plot_model_family_weather_regime_pair("FW0", "model_family_weather_regime_fw0")
+
+
+def plot_model_family_weather_regime_fw2() -> None:
+    plot_model_family_weather_regime_pair("FW2", "model_family_weather_regime_fw2")
+
+
+def plot_model_family_weather_regime_fw1() -> None:
+    plot_model_family_weather_regime_pair("FW1", "model_family_weather_regime_fw1")
+
+
 def plot_model_family_best_rmse() -> None:
     df = pd.read_csv(BASE_COMPARISON_CSV)
     context = aggregated_load_context()
     fig, axes = plt.subplots(1, 3, figsize=(13.8, 4.4), sharey=True)
 
-    colors = {"LSTM": "#c66b22", "XGBoost": "#17739f"}
-    markers = {"LSTM": "o", "XGBoost": "s"}
+    colors = MODEL_FAMILY_COLORS
+    markers = MODEL_FAMILY_MARKERS
 
     for ax, weather in zip(axes, WEATHER_ORDER):
         lstm = best_family_rows(df, weather, "lstm", ["M0", "M2", "M4"], regime="per_building")
@@ -976,51 +1257,6 @@ def plot_fw2_mode_delta_lines() -> None:
     plt.close(fig)
 
 
-def plot_fw2_building_family_delta() -> None:
-    df = pd.read_csv(SUPPLEMENT_METRICS_CSV)
-    df = df[(df["regime"] == "per_building") & (df["weather_mode"] == "FW2")].copy()
-    df["horizon_h"] = df["horizon_h"].astype(int)
-
-    lstm = best_metric_rows(df, "FW2", "lstm", ["M0", "M1", "M2", "M3", "M4"])
-    xgb = best_metric_rows(df, "FW2", "xgboost", ["M0", "M1", "M2", "M3", "M4"])
-    merged = lstm.merge(
-        xgb,
-        on=["building", "horizon_h"],
-        suffixes=("_lstm", "_xgb"),
-    )
-    merged["delta"] = merged["wape_pct_lstm"] - merged["wape_pct_xgb"]
-
-    building_order = ["LIB", "SOC", "U02B", "U03", "U05", "U06"]
-    matrix = (
-        merged.pivot(index="building", columns="horizon_h", values="delta")
-        .reindex(index=building_order, columns=HORIZONS)
-        .fillna(0.0)
-    )
-    vmax = max(abs(float(matrix.min().min())), abs(float(matrix.max().max())))
-    vmax = max(vmax, 0.1)
-
-    fig, ax = plt.subplots(figsize=(11.2, 4.3))
-    sns.heatmap(
-        matrix,
-        ax=ax,
-        cmap="RdBu_r",
-        center=0,
-        vmin=-vmax,
-        vmax=vmax,
-        linewidths=0.35,
-        linecolor="white",
-        cbar_kws={"label": "Best LSTM WAPE - best XGBoost WAPE (pp)"},
-    )
-    add_all_heatmap_labels(ax, matrix, signed=True, dark_threshold=max(vmax * 0.55, 0.35), fontsize=8.4)
-    ax.set_xlabel("Horizon (h)")
-    ax.set_ylabel("Building")
-    ax.set_xticklabels([str(h) for h in HORIZONS], rotation=0)
-    ax.set_yticklabels(matrix.index, rotation=0)
-    fig.tight_layout()
-    fig.savefig(figure_path("model_family_fw2_building_family_delta"), bbox_inches="tight")
-    plt.close(fig)
-
-
 def plot_weather_mode_example() -> None:
     usecols = [
         "regime",
@@ -1121,6 +1357,108 @@ def plot_weather_mode_example() -> None:
     ax.grid(True, color="#d8d8d8", linewidth=0.8)
     fig.tight_layout()
     fig.savefig(figure_path("model_family_weather_mode_example"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_bayes_fw2_baseline_families_wape() -> None:
+    df = pd.read_csv(BAYES_FW2_BASELINE_WAPE_CSV)
+    df["horizon_h"] = df["horizon_h"].astype(int)
+    df["horizon_pos"] = df["horizon_h"].map(HORIZON_POSITION_MAP)
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.3), sharey=True)
+
+    for ax, regime_label in zip(axes, ["Per-building", "Pooled"]):
+        panel_df = df[df["regime_label"] == regime_label].copy()
+        for baseline in BAYES_BASELINE_ORDER:
+            series = panel_df[panel_df["baseline"] == baseline].sort_values("horizon_h")
+            ax.plot(
+                series["horizon_pos"],
+                series["mean_wape_pct"],
+                color=BAYES_BASELINE_COLORS[baseline],
+                marker=BAYES_BASELINE_MARKERS[baseline],
+                linewidth=2.2,
+                markersize=6.0,
+                label=BAYES_BASELINE_LABELS[baseline],
+            )
+        ax.set_xticks(HORIZON_POSITIONS)
+        ax.set_xticklabels([str(h) for h in HORIZONS], fontsize=10)
+        ax.set_xlabel("Horizon (h)")
+        ax.grid(True, color="#d8d8d8", linewidth=0.8)
+        add_panel_label(ax, regime_label)
+
+    axes[0].set_ylabel("Mean WAPE (%)")
+    legend_handles = [
+        mlines.Line2D(
+            [],
+            [],
+            color=BAYES_BASELINE_COLORS[baseline],
+            marker=BAYES_BASELINE_MARKERS[baseline],
+            linewidth=2.2,
+            markersize=6.0,
+            label=BAYES_BASELINE_LABELS[baseline],
+        )
+        for baseline in BAYES_BASELINE_ORDER
+    ]
+    fig.legend(
+        legend_handles,
+        [h.get_label() for h in legend_handles],
+        loc="upper center",
+        ncol=3,
+        bbox_to_anchor=(0.5, 1.03),
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(figure_path("bayes_fw2_baseline_families_wape"), bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_bayes_fw2_best_baseline_vs_nonlinear_m4_wape() -> None:
+    df = pd.read_csv(BAYES_FW2_BEST_VS_NONLINEAR_M4_WAPE_CSV)
+    df["horizon_h"] = df["horizon_h"].astype(int)
+    df["horizon_pos"] = df["horizon_h"].map(HORIZON_POSITION_MAP)
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.3), sharey=True)
+
+    for ax, regime_label in zip(axes, ["Per-building", "Pooled"]):
+        panel_df = df[df["regime_label"] == regime_label].copy()
+        for series_label in BAYES_OVERLAY_ORDER:
+            series = panel_df[panel_df["series_label"] == series_label].sort_values("horizon_h")
+            ax.plot(
+                series["horizon_pos"],
+                series["mean_wape_pct"],
+                color=BAYES_OVERLAY_COLORS[series_label],
+                marker=BAYES_OVERLAY_MARKERS[series_label],
+                linestyle=BAYES_OVERLAY_LINESTYLES[series_label],
+                linewidth=2.2,
+                markersize=6.0,
+                label=BAYES_OVERLAY_LABELS[series_label],
+            )
+        ax.set_xticks(HORIZON_POSITIONS)
+        ax.set_xticklabels([str(h) for h in HORIZONS], fontsize=10)
+        ax.set_xlabel("Horizon (h)")
+        ax.grid(True, color="#d8d8d8", linewidth=0.8)
+        add_panel_label(ax, regime_label)
+
+    axes[0].set_ylabel("Mean WAPE (%)")
+    legend_handles = [
+        mlines.Line2D(
+            [],
+            [],
+            color=BAYES_OVERLAY_COLORS[series_label],
+            marker=BAYES_OVERLAY_MARKERS[series_label],
+            linestyle=BAYES_OVERLAY_LINESTYLES[series_label],
+            linewidth=2.2,
+            markersize=6.0,
+            label=BAYES_OVERLAY_LABELS[series_label],
+        )
+        for series_label in BAYES_OVERLAY_ORDER
+    ]
+    fig.legend(
+        legend_handles,
+        [h.get_label() for h in legend_handles],
+        loc="upper center",
+        ncol=3,
+        bbox_to_anchor=(0.5, 1.03),
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    fig.savefig(figure_path("bayes_fw2_best_baseline_vs_nonlinear_m4_wape"), bbox_inches="tight")
     plt.close(fig)
 
 
@@ -1474,10 +1812,6 @@ def plot_xai_mode_scope_compare_pfi(mode: str) -> None:
 
 
 def plot_xai_fw2_m4_pfi_shap_driver_share_for_regime(regime: str, output_name: str, panel_title: str) -> None:
-    matrices = {
-        method: xai_share_matrix(method, weather_mode="FW2", regime=regime)
-        for method in ["pfi", "shap"]
-    }
     df = pd.read_csv(XAI_GROUP_SHARE_FINE_CSV)
     df = df[
         (df["regime"] == regime)
@@ -1486,14 +1820,15 @@ def plot_xai_fw2_m4_pfi_shap_driver_share_for_regime(regime: str, output_name: s
         & (df["weather_mode"] == "FW2")
     ].copy()
     df["horizon_h"] = df["horizon_h"].astype(int)
-    df["share"] = df["share"].astype(float)
+    df["share_pct"] = df["share"].astype(float) * 100.0
+    matrices: dict[str, pd.DataFrame] = {}
     for method in ["pfi", "shap"]:
         grouped = (
             df[df["method"] == method]
-            .groupby(["feature_group", "horizon_h"], as_index=False)["share"]
+            .groupby(["feature_group", "horizon_h"], as_index=False)["share_pct"]
             .mean()
         )
-        matrix = grouped.pivot(index="feature_group", columns="horizon_h", values="share")
+        matrix = grouped.pivot(index="feature_group", columns="horizon_h", values="share_pct")
         matrices[method] = (
             matrix.reindex(FINE_GROUP_ORDER)
             .reindex(columns=[h for h in HORIZONS if h in matrix.columns])
@@ -1501,9 +1836,9 @@ def plot_xai_fw2_m4_pfi_shap_driver_share_for_regime(regime: str, output_name: s
         )
 
     vmax = max(float(matrix.max().max()) for matrix in matrices.values())
-    vmax = max(vmax, 0.01)
+    vmax = max(vmax, 1.0)
 
-    fig, axes = plt.subplots(1, 2, figsize=(13.8, 5.8), sharey=False)
+    fig, axes = plt.subplots(1, 2, figsize=(13.4, 5.6), sharey=False)
     for ax, method, label in zip(axes, ["pfi", "shap"], ["PFI", "SHAP"]):
         matrix = matrices[method]
         sns.heatmap(
@@ -1515,15 +1850,63 @@ def plot_xai_fw2_m4_pfi_shap_driver_share_for_regime(regime: str, output_name: s
             linewidths=0.35,
             linecolor="white",
             cbar=(method == "shap"),
-            cbar_kws={"label": "Mean share"} if method == "shap" else None,
+            cbar_kws={"label": "Mean share (%)"} if method == "shap" else None,
         )
-        add_all_heatmap_labels(ax, matrix, signed=False, dark_threshold=max(vmax * 0.55, 0.30), fontsize=7.3)
+        add_all_heatmap_labels(ax, matrix, signed=False, dark_threshold=max(vmax * 0.55, 20.0), fontsize=6.8)
         ax.set_xlabel("Horizon (h)")
         ax.set_ylabel("Fine feature group")
         ax.set_yticklabels([FINE_GROUP_LABELS[g] for g in matrix.index], rotation=0, fontsize=9.5)
         ax.set_xticklabels([str(h) for h in matrix.columns], rotation=0, fontsize=9.5)
         ax.set_title(label, fontsize=13.5, fontweight="bold", pad=10)
 
+    fig.tight_layout()
+    fig.savefig(figure_path(output_name), bbox_inches="tight")
+    plt.close(fig)
+
+
+def xai_fw2_m4_driver_share_matrix(regime: str, method: str) -> pd.DataFrame:
+    df = pd.read_csv(XAI_GROUP_SHARE_FINE_CSV)
+    df = df[
+        (df["regime"] == regime)
+        & (df["model_family"] == "xgboost")
+        & (df["mode"] == "M4")
+        & (df["weather_mode"] == "FW2")
+        & (df["method"] == method)
+    ].copy()
+    df["horizon_h"] = df["horizon_h"].astype(int)
+    df["share_pct"] = df["share"].astype(float) * 100.0
+    grouped = df.groupby(["feature_group", "horizon_h"], as_index=False)["share_pct"].mean()
+    matrix = grouped.pivot(index="feature_group", columns="horizon_h", values="share_pct")
+    return (
+        matrix.reindex(FINE_GROUP_ORDER)
+        .reindex(columns=[h for h in HORIZONS if h in matrix.columns])
+        .fillna(0.0)
+    )
+
+
+def plot_xai_fw2_m4_driver_share(regime: str, method: str, output_name: str) -> None:
+    matrix = xai_fw2_m4_driver_share_matrix(regime, method)
+    comparison_method = "shap" if method == "pfi" else "pfi"
+    comparison = xai_fw2_m4_driver_share_matrix(regime, comparison_method)
+    vmax = max(float(matrix.max().max()), float(comparison.max().max()), 1.0)
+
+    fig, ax = plt.subplots(figsize=(8.7, 5.55))
+    sns.heatmap(
+        matrix,
+        ax=ax,
+        cmap="YlGnBu",
+        vmin=0,
+        vmax=vmax,
+        linewidths=0.35,
+        linecolor="white",
+        cbar=True,
+        cbar_kws={"label": "Mean share (%)", "shrink": 0.88},
+    )
+    add_all_heatmap_labels(ax, matrix, signed=False, dark_threshold=max(vmax * 0.55, 20.0), fontsize=7.2)
+    ax.set_xlabel("Horizon (h)")
+    ax.set_ylabel("Fine feature group")
+    ax.set_yticklabels([FINE_GROUP_LABELS[g] for g in matrix.index], rotation=0, fontsize=9.6)
+    ax.set_xticklabels([str(h) for h in matrix.columns], rotation=0, fontsize=9.6)
     fig.tight_layout()
     fig.savefig(figure_path(output_name), bbox_inches="tight")
     plt.close(fig)
@@ -1545,38 +1928,110 @@ def plot_xai_fw2_m4_pooled_pfi_shap_driver_share() -> None:
     )
 
 
+def plot_xai_fw2_m4_per_building_pfi_driver_share() -> None:
+    plot_xai_fw2_m4_driver_share(
+        "per_building",
+        "pfi",
+        "xai_fw2_m4_per_building_pfi_driver_share",
+    )
+
+
+def plot_xai_fw2_m4_per_building_shap_driver_share() -> None:
+    plot_xai_fw2_m4_driver_share(
+        "per_building",
+        "shap",
+        "xai_fw2_m4_per_building_shap_driver_share",
+    )
+
+
+def plot_xai_fw2_m4_pooled_pfi_driver_share() -> None:
+    plot_xai_fw2_m4_driver_share(
+        "pooled_same_buildings",
+        "pfi",
+        "xai_fw2_m4_pooled_pfi_driver_share",
+    )
+
+
+def plot_xai_fw2_m4_pooled_shap_driver_share() -> None:
+    plot_xai_fw2_m4_driver_share(
+        "pooled_same_buildings",
+        "shap",
+        "xai_fw2_m4_pooled_shap_driver_share",
+    )
+
+
+def plot_xai_fw2_m4_scope_method_driver_share() -> None:
+    df = pd.read_csv(XAI_GROUP_SHARE_FINE_CSV)
+    df = df[
+        (df["model_family"] == "xgboost")
+        & (df["mode"] == "M4")
+        & (df["weather_mode"] == "FW2")
+    ].copy()
+    df["horizon_h"] = df["horizon_h"].astype(int)
+    df["share_pct"] = df["share"].astype(float) * 100.0
+
+    regimes = [
+        ("per_building", "Per-building"),
+        ("pooled_same_buildings", "Pooled same-buildings"),
+    ]
+    methods = [("pfi", "PFI"), ("shap", "SHAP")]
+    matrices: dict[tuple[str, str], pd.DataFrame] = {}
+    for regime, _ in regimes:
+        for method, _ in methods:
+            grouped = (
+                df[(df["regime"] == regime) & (df["method"] == method)]
+                .groupby(["feature_group", "horizon_h"], as_index=False)["share_pct"]
+                .mean()
+            )
+            matrix = grouped.pivot(index="feature_group", columns="horizon_h", values="share_pct")
+            matrices[(regime, method)] = (
+                matrix.reindex(FINE_GROUP_ORDER)
+                .reindex(columns=[h for h in HORIZONS if h in matrix.columns])
+                .fillna(0.0)
+            )
+
+    vmax = max(float(matrix.max().max()) for matrix in matrices.values())
+    vmax = max(vmax, 1.0)
+    fig, axes = plt.subplots(2, 2, figsize=(13.4, 8.3), sharey=False)
+    for row_idx, (regime, regime_label) in enumerate(regimes):
+        for col_idx, (method, method_label) in enumerate(methods):
+            ax = axes[row_idx, col_idx]
+            matrix = matrices[(regime, method)]
+            sns.heatmap(
+                matrix,
+                ax=ax,
+                cmap="YlGnBu",
+                vmin=0,
+                vmax=vmax,
+                linewidths=0.35,
+                linecolor="white",
+                cbar=(row_idx == 1 and col_idx == 1),
+                cbar_kws={"label": "Mean share (%)", "shrink": 0.82} if (row_idx == 1 and col_idx == 1) else None,
+            )
+            ax.set_xlabel("Horizon (h)" if row_idx == 1 else "", fontsize=10)
+            ax.set_ylabel("Fine feature group" if col_idx == 0 else "", fontsize=10)
+            ax.set_xticklabels([str(h) for h in matrix.columns], rotation=0, fontsize=8)
+            ax.set_yticklabels([FINE_GROUP_LABELS[g] for g in matrix.index], rotation=0, fontsize=8)
+            ax.set_title(f"{regime_label}; {method_label}", fontsize=11.5, fontweight="bold", pad=8)
+            add_all_heatmap_labels(ax, matrix, signed=False, dark_threshold=max(vmax * 0.55, 20.0), fontsize=5.8)
+
+    fig.tight_layout()
+    fig.subplots_adjust(hspace=0.34, wspace=0.34)
+    fig.savefig(figure_path("xai_fw2_m4_scope_method_driver_share"), bbox_inches="tight")
+    plt.close(fig)
+
+
 FIGURE_BUILDERS = {
-    "baseline_point_horizon_portfolio_curves": plot_baseline_point_horizon_portfolio_curves,
-    "baseline_point_horizon_U05_traces": plot_baseline_point_horizon_u05_traces,
-    "baseline_train_test_weekly_overlay_u05": plot_baseline_train_test_weekly_overlay_u05,
-    "model_family_best_wape_by_weather": lambda: plot_model_family_best_wape("per_building", "model_family_best_wape_by_weather"),
-    "model_family_best_wape_by_weather_pooled": lambda: plot_model_family_best_wape("pooled_same_buildings", "model_family_best_wape_by_weather_pooled"),
-    "model_family_wape_scope_compare_fw0": lambda: plot_model_family_weather_scope_comparison("FW0"),
-    "model_family_wape_scope_compare_fw2": lambda: plot_model_family_weather_scope_comparison("FW2"),
-    "model_family_wape_scope_compare_fw1": lambda: plot_model_family_weather_scope_comparison("FW1"),
-    "model_family_weather_mode_example": plot_weather_mode_example,
-    "model_family_best_rmse_by_weather": plot_model_family_best_rmse,
-    "model_family_fw2_mode_extension": plot_fw2_mode_extension,
-    "model_family_fw2_mode_delta_heatmap": plot_fw2_mode_delta_heatmap,
-    "model_family_fw2_mode_delta_lines": plot_fw2_mode_delta_lines,
-    "model_family_fw2_building_family_delta": plot_fw2_building_family_delta,
-    "xai_driver_classes_fine_pfi": lambda: plot_xai_driver_shares("pfi", "xai_driver_classes_fine_pfi"),
-    "xai_driver_classes_fine_shap": lambda: plot_xai_driver_shares("shap", "xai_driver_classes_fine_shap"),
-    "xai_weather_roles_fine_pfi_fw0": lambda: plot_xai_weather_role_single("FW0"),
-    "xai_weather_roles_fine_pfi_fw2": lambda: plot_xai_weather_role_single("FW2"),
-    "xai_weather_roles_fine_pfi_fw1": lambda: plot_xai_weather_role_single("FW1"),
-    "xai_mode_transition_fine_fw0_pfi": plot_xai_mode_transition,
-    "xai_fw2_mode_group_shares_pfi": lambda: plot_fw2_mode_group_shares("pfi", "xai_fw2_mode_group_shares_pfi"),
-    "xai_fw2_mode_group_shares_shap": lambda: plot_fw2_mode_group_shares("shap", "xai_fw2_mode_group_shares_shap"),
-    "xai_mode_feature_shares_m0": lambda: plot_mode_feature_share_heatmaps("M0"),
-    "xai_mode_feature_shares_m1": lambda: plot_mode_feature_share_heatmaps("M1"),
-    "xai_mode_feature_shares_m2": lambda: plot_mode_feature_share_heatmaps("M2"),
-    "xai_mode_feature_shares_m3": lambda: plot_mode_feature_share_heatmaps("M3"),
-    "xai_mode_feature_shares_m4": lambda: plot_mode_feature_share_heatmaps("M4"),
-    "xai_mode_scope_compare_pfi_m0": lambda: plot_xai_mode_scope_compare_pfi("M0"),
-    "xai_mode_scope_compare_pfi_m4": lambda: plot_xai_mode_scope_compare_pfi("M4"),
-    "xai_fw2_m4_pfi_shap_driver_share": plot_xai_fw2_m4_pfi_shap_driver_share,
-    "xai_fw2_m4_pooled_pfi_shap_driver_share": plot_xai_fw2_m4_pooled_pfi_shap_driver_share,
+    "observed_temperature_demand_context": plot_observed_temperature_demand_context,
+    "model_family_weather_regime_fw0": plot_model_family_weather_regime_fw0,
+    "model_family_weather_regime_fw2": plot_model_family_weather_regime_fw2,
+    "model_family_weather_regime_fw1": plot_model_family_weather_regime_fw1,
+    "bayes_fw2_baseline_families_wape": plot_bayes_fw2_baseline_families_wape,
+    "bayes_fw2_best_baseline_vs_nonlinear_m4_wape": plot_bayes_fw2_best_baseline_vs_nonlinear_m4_wape,
+    "xai_fw2_m4_per_building_pfi_driver_share": plot_xai_fw2_m4_per_building_pfi_driver_share,
+    "xai_fw2_m4_per_building_shap_driver_share": plot_xai_fw2_m4_per_building_shap_driver_share,
+    "xai_fw2_m4_pooled_pfi_driver_share": plot_xai_fw2_m4_pooled_pfi_driver_share,
+    "xai_fw2_m4_pooled_shap_driver_share": plot_xai_fw2_m4_pooled_shap_driver_share,
 }
 
 
