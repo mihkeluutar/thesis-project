@@ -1,0 +1,30 @@
+# Core stack for notebooks, utils/, and scripts/.
+# Install: python -m pip install -r requirements.txt
+# Python: see README (3.10+ recommended).
+
+numpy>=1.23,<3
+pandas>=2.0,<3
+matplotlib>=3.7,<4
+seaborn>=0.13,<1
+scikit-learn>=1.3,<2
+openpyxl>=3.1,<4
+
+# Bayesian energy-signature models (utils/bayesian_energy_signature.py)
+pymc>=5.10,<6
+arviz>=0.18,<1
+
+# Tabular models and XAI notebooks
+xgboost>=2.0,<3
+shap>=0.44,<1
+
+# LSTM notebooks (TensorFlow includes Keras)
+tensorflow>=2.14,<3
+
+# Feature engineering / diagnostics (notebooks)
+statsmodels>=0.14,<1
+tqdm>=4.66,<5
+
+# Running Jupyter notebooks locally
+jupyter>=1.0.0,<2
+ipykernel>=6.25,<7
+ipywidgets>=8.0,<9

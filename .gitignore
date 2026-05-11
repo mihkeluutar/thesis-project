@@ -49,6 +49,7 @@ htmlcov/
 
 # --- OS / editor noise ---
 .DS_Store
+.mplconfig/
 .AppleDouble
 .LSOverride
 Thumbs.db
